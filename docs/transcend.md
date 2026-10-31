@@ -28,7 +28,7 @@ Cost is `ceil(base × growth^level)`. Multipliers aggregate under source `transc
 |---|---|---|
 | engine | perk `autoAscend`. Config panel edits `SF.state.ascension.auto`, plus a smart mode: ascend when gain ≥ X × unspent shards | 1 |
 | apprentice / clockwork / blueprints | perks `autoForgeUpgrades` / `autoForge` / `keepForgeUpgrades` | 1 |
-| workshop (Artificer's Workshop, cost 6) / eye (Artificer's Eye, cost 12, revealed once the Workshop is owned) | perks `autoCraft` / `autoCraftSmart`: Rift Auto-Craft on equipped relics (Ascendant Orb, Prism; with the Eye also Lumen and Flux, which are reverted if Combat Power drops). Configured on Rifts → Crafting; see docs/rifts.md | 1 |
+| workshop (Artificer's Workshop, cost 6) / eye (Artificer's Eye, cost 12, revealed once the Workshop is owned) | perks `autoCraft` / `autoCraftSmart`: Rift Auto-Craft on equipped relics (Ascendant Orb, Prism; with the Eye also Lumen and Flux, which are reverted if Combat Power or economy bonuses drop, and never touch locked relics). Configured on Rifts → Crafting; see docs/rifts.md | 1 |
 | sifter / compass / snare | perks `riftSifter` (salvage ×1.5, 20% currency from auto-salvaged Magic/Rare) / `riftHeadStart` (rifts restart at 40% of best depth after Transcend) / `autoComet` | 1 |
 | mercy (Cartographer's Mercy) | `constellation.respecCost` ×0.5^L | 4 |
 | return | Auto-Transcend (min echoes, min cycle time); revealed at 3 transcends | 1 |

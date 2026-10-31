@@ -192,6 +192,7 @@ async function visitAllTabs(page, tag) {
     st.claimed[35] = true; st.bestEver = Math.max(st.bestEver, 35); SF.mods.invalidate();
     r.perkEquip = SF.perks.has('autoEquip');
     st.auto.equip = true; st.auto.equipUniques = true; // the 30-min farm may have equipped uniques
+    st.auto.keepEcon = false; // (a)-(e) test combat swaps; the economy guard is tested in (f)
     for (const s of I.SLOTS) if (st.equipped[s]) st.equipped[s].locked = false;
     I.salvage(st.inventory.filter((x) => x.rarity !== 'unique').slice(0, 15).map((x) => x.id));
     // (a) stash upgrade gets equipped by the periodic headless scan
@@ -234,6 +235,26 @@ async function visitAllTabs(page, tag) {
     SF.rifts.autoEquipScan();
     r.uniqueReplacedWhenAllowed = st.equipped[uq.slot].id !== uq.id;
     st.auto.equipUniques = false;
+    // (e) full stash: the replaced relic is moved to the stash, never melted
+    const fill = [];
+    while (st.inventory.length < I.capacity()) { const f = I.generate(5, 'normal'); I._rawAdd(f, { force: true }); fill.push(f.id); }
+    st.equipped.ring && (st.equipped.ring.locked = false);
+    const oldRing = st.equipped.ring;
+    const nr = upgrade('ring', Math.max(100, st.maxCleared + 80));
+    r.fullDelta = I.powerDelta(nr);
+    SF.rifts.receiveItem(nr, { source: 'rift' });
+    r.fullEquipped = I.isEquipped(nr.id);
+    r.fullPrevKept = !oldRing || st.inventory.some((x) => x.id === oldRing.id);
+    // (f) Keep economy relics: an econ-heavy relic is not swapped for a combat-only one
+    st.auto.keepEcon = true;
+    let ecoR = null;
+    for (let i = 0; i < 400 && !ecoR; i++) { const x = I.generate(Math.max(20, st.maxCleared), 'rare', { slot: 'ring' }); if (I.econScore(x) > 30) ecoR = x; }
+    I._rawAdd(ecoR, { force: true }); I.equip(ecoR.id);
+    let comb = null;
+    for (let i = 0; i < 400 && !comb; i++) { const x = I.generate(Math.max(120, st.maxCleared + 100), 'rare', { slot: 'ring' }); if (I.econScore(x) < I.econScore(ecoR) && I.powerDelta(x) > 0.02) comb = x; }
+    r.ecoTested = !!comb;
+    if (comb) { I._rawAdd(comb, { force: true }); SF.rifts.autoEquipScan(); r.ecoKept = st.equipped.ring.id !== comb.id && I.econScore(st.equipped.ring) >= I.econScore(ecoR); } else r.ecoKept = true;
+    I.salvage(fill.concat(comb ? [comb.id] : []));
     r.autoEquips = st.stats.autoEquips;
     // --- Auto-Craft: Echo upgrades
     r.perkCraftOff = SF.perks.has('autoCraft');
@@ -277,14 +298,24 @@ async function visitAllTabs(page, tag) {
     T.upg.eye = 1; SF.mods.invalidate();
     r.perkSmart = SF.perks.has('autoCraftSmart');
     st.auto.cur.ascendant.on = false; st.auto.cur.prism.on = false;
+    // locked relics are never rerolled
+    am.locked = true; ring2.locked = true;
+    SF.rifts.autoCraftRun(10);
+    r.smartLockedSkipped = st.cur.lumen === lumen0 && st.cur.flux === 60;
+    am.locked = false; ring2.locked = false;
+    // Workshop owned but switched off in Transcendence: the panel must not claim it must be bought
+    T.toggles.workshop = false; SF.mods.invalidate();
+    r.toggledOffPerk = SF.perks.has('autoCraft');
+    delete T.toggles.workshop; SF.mods.invalidate();
     st.auto.cur.lumen.keep = 5; st.auto.cur.flux.keep = 5;
-    let worse = 0, runs = 0, p = SF.rifts.computeWarden().power;
+    const econSum = () => I.SLOTS.reduce((t, sl) => t + (st.equipped[sl] ? I.econScore(st.equipped[sl]) : 0), 0);
+    let worse = 0, runs = 0, p = SF.rifts.computeWarden().power, e = econSum();
     const pStart = p;
     for (let i = 0; i < 40; i++) {
       runs += SF.rifts.autoCraftRun(3);
-      const q = SF.rifts.computeWarden().power;
-      if (q < p * (1 - 1e-9)) worse++;
-      p = q;
+      const q = SF.rifts.computeWarden().power, eq = econSum();
+      if (q < p * (1 - 1e-9) || eq < e - 1e-9) worse++;
+      p = q; e = eq;
     }
     r.smartRuns = runs; r.smartWorse = worse; r.pStart = pStart; r.pEnd = p;
     r.smartReserve = st.cur.lumen >= 5 && st.cur.flux >= 5;
@@ -310,7 +341,11 @@ async function visitAllTabs(page, tag) {
   check('auto-craft uses Ascendant Orb / Prism on equipped relics', au.ascUsed && au.prismUsed && au.amAffixes > 1 && au.counted, au);
   check('auto-craft respects reserves', au.reserves && au.reserveHold, au);
   check('Lumen/Flux auto-craft gated behind Artificer\'s Eye', au.smartGated && au.perkSmart, au);
-  check('smart auto-craft never lowers Combat Power', au.smartRuns > 0 && au.smartWorse === 0 && au.pEnd >= au.pStart && au.smartReserve, au);
+  check('auto-equip never melts the replaced relic (full stash)', au.fullDelta > 0.01 && au.fullEquipped && au.fullPrevKept, au);
+  check('auto-equip keeps economy relics (Keep economy relics)', au.ecoKept, au);
+  check('smart auto-craft skips locked relics', au.smartLockedSkipped, au);
+  check('Workshop toggled off in Transcendence disables Auto-Craft', au.toggledOffPerk === false, au);
+  check('smart auto-craft never lowers Combat Power or economy', au.smartRuns > 0 && au.smartWorse === 0 && au.pEnd >= au.pStart && au.smartReserve, au);
   check('automation log written', au.log > 0, au);
 
   section('Layer 2 — Transcendence');

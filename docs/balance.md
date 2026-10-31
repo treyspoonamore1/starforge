@@ -87,6 +87,7 @@ Measured at the end of a 64 h run with a full stash (~550 relics), all tabs and 
 | Live tick (dt 0.05) | 0.13–0.29 ms | — |
 | Headless tick | 0.14–0.4 ms | — |
 | Largest offline catch-up (7 days at the 24 h state: 300 × 1 s steps + ≤ 4000 steps) | ~1.0 s | 24 h in 3000 steps: 0.5–0.8 s |
+| Offline catch-up with Rift automation (24 h `catchup`, depth 150, full stash, 1e6 of every currency) | automation off ~0.22 s; Auto-Equip + Auto-Craft with Eye, Flux and Lumen on ~0.45 s (~750 auto-crafts/day thanks to the smart back-off). The 6 h bot reports max offline catch-up 0.83 s | before the back-off: 1.3–1.4 s, ~12 000 auto-crafts/day |
 | `tick + ui.update` per tab | ≤ 2.5 ms; worst tabs are Rifts → Combat and the Achievements grid | — |
 | `SF.items.equipBest()` | ~4 ms at 170 relics; extrapolated ~13 ms at 550 | about 16× slower |
 

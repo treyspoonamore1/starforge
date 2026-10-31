@@ -143,7 +143,7 @@
     log: [],
     // Automation settings (Auto-Equip: Atlas milestone; Auto-Craft: Echo upgrades). keep = reserve never spent.
     auto: {
-      equip: true, equipUniques: false, craft: true,
+      equip: true, equipUniques: false, keepEcon: true, craft: true,
       cur: { ascendant: { on: true, keep: 1 }, prism: { on: true, keep: 2 }, flux: { on: false, keep: 10 }, lumen: { on: false, keep: 10 } },
       log: [],
     },
@@ -155,7 +155,7 @@
   const rt = {
     fx: [], dmgAcc: 0, dmgT: 0, dpsHist: [], sessionKills: 0, sessionTime: 0, genThisTick: 0,
     wCache: null, wKey: '', lastCraft: null, offlineSnap: null, bannerT: 0, banner: null,
-    aeT: 0, acT: 0, acRot: 0, aeToast: [], aeToastAt: 0,
+    aeT: 0, acT: 0, acRot: 0, acClock: 0, acBack: {}, aeToast: [], aeToastAt: 0,
   };
   function pushFx(e) { if (headless()) return; rt.fx.push(e); if (rt.fx.length > 80) rt.fx.splice(0, rt.fx.length - 80); }
 
@@ -653,7 +653,10 @@
     equipEveryHeadless: 1800, // ... while headless: drops are checked the moment they arrive, so the full
                              //     stash scan (~1 power calc per relic) only catches slow drifts (levels, crafts)
     craftEvery: 10,          // seconds of game time per Auto-Craft interval
-    craftPerInterval: 3,     // max currencies used per interval
+    craftPerInterval: 3,     // max currencies used per interval (round-robin between the enabled currencies)
+    smartStrikes: 4,         // Lumen/Flux: crafts in a row that do not improve a relic before that currency rests on it
+    smartRest: 300,          // ... first rest (s of game time), doubling each time, up to smartRestMax
+    smartRestMax: 6 * 3600,
     craftMaxIntervals: 6,    // max intervals banked (live)
     craftMaxPerTick: 1,      // intervals resolved per tick while headless (offline steps are up to ~30s; each
                              // craft re-evaluates gear, so this bounds catch-up cost while still crafting every step)
@@ -694,64 +697,120 @@
     autoLog('Equipped ' + it.name + ' (' + I.SLOT_INFO[it.slot].name + ')', 'equip');
     if (!headless()) rt.aeToast.push({ name: it.name, r: it.rarity, gain });
   }
+  /** Economy guard ("Keep economy relics", default on): never trade away economy affixes for Combat Power. */
+  function autoEconOk(it, prev) {
+    if (!prev || autoCfg().keepEcon === false) return true;
+    if (prev.rarity === 'unique' && autoCfg().equipUniques) return true; // explicit opt-in (see its tooltip)
+    return I.econScore(it) >= I.econScore(prev) - 1e-9;
+  }
   /** Equip a freshly received relic immediately if it beats the equipped one by AUTO.equipMin. */
   function autoEquipDrop(it) {
     if (!it || !autoEquipOn() || !autoCanReplace(it.slot)) return false;
     const st = S();
+    const prev = st.equipped[it.slot];
+    // the replaced relic always goes to the stash (never melted). A full stash may overflow like Uniques do
+    // (+20); beyond that the drop is left to the normal salvage rules instead.
+    if (prev && st.inventory.length >= I.capacity() + 20) return false;
+    if (!autoEconOk(it, prev)) return false;
     const gain = I.powerDelta(it);
     if (!(gain > AUTO.equipMin)) return false;
-    const prev = st.equipped[it.slot];
     I._rawAdd(it, { force: true });
-    if (!I.equip(it.id)) return false;
+    if (!I.equip(it.id)) { st.inventory = st.inventory.filter((x) => x !== it); I._invVer++; return false; }
     it.isNew = false;
-    // the replaced relic goes to the stash; if that overfills it, melt it (never locked ones or Uniques)
-    if (prev && st.inventory.length > I.capacity() && !prev.locked && prev.rarity !== 'unique') I.salvage([prev.id]);
     noteAutoEquip(it, gain);
     return true;
   }
   /** Scan the stash for upgrades (respecting locks). Returns the number of swaps. */
   function autoEquipScan() {
     if (!autoEquipOn()) return 0;
-    return I.equipBest(AUTO.equipMin, { skipSlot: (slot) => !autoCanReplace(slot), onSwap: (it, prev, gain) => noteAutoEquip(it, gain) });
+    return I.equipBest(AUTO.equipMin, {
+      skipSlot: (slot) => !autoCanReplace(slot),
+      accept: (it, prev) => autoEconOk(it, prev),
+      onSwap: (it, prev, gain) => noteAutoEquip(it, gain),
+    });
   }
   function restoreItem(it, snap) {
     for (const k of Object.keys(it)) delete it[k];
     Object.assign(it, snap);
   }
-  /** One Auto-Craft interval: up to `cap` currencies on equipped, non-unique, uncorrupted relics. Returns crafts made. */
-  function autoCraftRun(cap) {
+  /** Smart-craft back-off: after AUTO.smartStrikes crafts in a row that did not improve a relic, that
+   *  currency rests on it for an exponentially growing time (resets when a craft improves it). */
+  function smartBackoff(it, cur) {
+    const b = rt.acBack[it.id + ':' + cur];
+    return !!(b && b.until > rt.acClock);
+  }
+  function smartResult(it, cur, improved) {
+    const key = it.id + ':' + cur;
+    if (improved) { delete rt.acBack[key]; return; }
+    const b = rt.acBack[key] || (rt.acBack[key] = { n: 0, k: 0, until: 0 });
+    if (++b.n >= AUTO.smartStrikes) {
+      b.n = 0;
+      b.until = rt.acClock + Math.min(AUTO.smartRestMax, AUTO.smartRest * Math.pow(2, b.k++));
+    }
+  }
+  /** Try one craft of `cur` on the next eligible equipped relic. Returns true if a currency was used. */
+  function autoCraftOne(cur, smart, slotStart) {
     const st = S();
+    const c = autoCfg().cur[cur];
+    const keep = Math.max(0, Math.floor(Number(c.keep) || 0));
+    for (let k = 0; k < I.SLOTS.length; k++) {
+      if ((st.cur[cur] || 0) <= keep) return false; // reserve
+      const it = st.equipped[I.SLOTS[(slotStart + k) % I.SLOTS.length]];
+      if (!it || it.rarity === 'unique' || it.corrupted) continue;
+      if (cur === 'ascendant' && it.rarity === 'rare') continue; // only Normal -> Magic -> Rare
+      if (smart && it.locked) continue;                          // rerolls never touch a locked relic
+      if (smart && smartBackoff(it, cur)) continue;
+      if (I.canCraft(it, cur)) continue;
+      const snap = smart ? I.clone(it) : null;
+      const p0 = smart ? computeWarden().power : 0, e0 = smart ? I.econScore(it) : 0;
+      const r = I.craft(it.id, cur);
+      if (!r || !r.ok) continue;
+      st.stats.autoCrafts = (st.stats.autoCrafts || 0) + 1;
+      const cname = I.CUR_BY_ID[cur].name;
+      if (smart) {
+        const p1 = computeWarden().power, e1 = I.econScore(it);
+        const eps = 1e-9;
+        if (p1 < p0 * (1 - eps) || e1 < e0 - eps) {
+          restoreItem(it, snap);
+          I.bump();
+          st.stats.autoCraftReverts = (st.stats.autoCraftReverts || 0) + 1;
+          smartResult(it, cur, false);
+          autoLog(cname + ' on ' + it.name + ': worse, reverted', 'revert');
+        } else {
+          const better = p1 > p0 * (1 + eps) || e1 > e0 + eps;
+          smartResult(it, cur, better);
+          autoLog(cname + ' on ' + it.name + (p0 > 0 && p1 > p0 * (1 + eps) ? ': +' + ((p1 / p0 - 1) * 100).toFixed(1) + '% power' : better ? ': economy up' : ': no change'), 'craft');
+        }
+      } else autoLog(cname + ' on ' + it.name + (r.after && r.before && r.after.rarity !== r.before.rarity ? ' → ' + I.RARITY_INFO[r.after.rarity].name : ''), 'craft');
+      return true;
+    }
+    return false;
+  }
+  /**
+   * One Auto-Craft interval: up to `cap` currencies on equipped, non-unique, uncorrupted relics. Currencies take
+   * turns (round-robin) so one cannot starve the others; Lumen/Flux get at most one craft each per interval.
+   * Returns crafts made.
+   */
+  function autoCraftRun(cap) {
     const a = autoCfg();
-    const smart = SF.perks.has('autoCraftSmart');
-    let done = 0;
-    rt.acRot = (rt.acRot + 1) % I.SLOTS.length; // rotate the starting slot so one relic can't hog every interval
-    for (const cur of AUTO_CURS) {
-      const c = a.cur[cur];
-      if (!c || !c.on || done >= cap) continue;
-      if (SMART_CURS[cur] && !smart) continue;
-      const keep = Math.max(0, Math.floor(Number(c.keep) || 0));
-      for (let k = 0; k < I.SLOTS.length && done < cap; k++) {
-        if ((st.cur[cur] || 0) <= keep) break; // reserve
-        const it = st.equipped[I.SLOTS[(rt.acRot + k) % I.SLOTS.length]];
-        if (!it || it.rarity === 'unique' || it.corrupted) continue;
-        if (cur === 'ascendant' && it.rarity === 'rare') continue; // only Normal -> Magic -> Rare
-        if (I.canCraft(it, cur)) continue;
-        const snap = SMART_CURS[cur] ? I.clone(it) : null;
-        const p0 = snap ? computeWarden().power : 0;
-        const r = I.craft(it.id, cur);
-        if (!r || !r.ok) continue;
-        done++;
-        st.stats.autoCrafts = (st.stats.autoCrafts || 0) + 1;
-        const cname = I.CUR_BY_ID[cur].name;
-        if (snap) {
-          const p1 = computeWarden().power;
-          if (p1 < p0 * (1 - 1e-9)) {
-            restoreItem(it, snap);
-            I.bump();
-            st.stats.autoCraftReverts = (st.stats.autoCraftReverts || 0) + 1;
-            autoLog(cname + ' on ' + it.name + ': worse, reverted', 'revert');
-          } else autoLog(cname + ' on ' + it.name + (p0 > 0 && p1 > p0 ? ': +' + ((p1 / p0 - 1) * 100).toFixed(1) + '% power' : ''), 'craft');
-        } else autoLog(cname + ' on ' + it.name + (r.after && r.before && r.after.rarity !== r.before.rarity ? ' → ' + I.RARITY_INFO[r.after.rarity].name : ''), 'craft');
+    const smartPerk = SF.perks.has('autoCraftSmart');
+    rt.acRot = (rt.acRot + 1) % (I.SLOTS.length * AUTO_CURS.length);
+    const slotStart = rt.acRot % I.SLOTS.length;
+    // Ascendant then Prism keep their priority (upgrade first, then fill slots); Flux and Lumen alternate
+    // which goes first so neither can shut the other out.
+    const order = rt.acRot % 2 ? ['ascendant', 'prism', 'lumen', 'flux'] : ['ascendant', 'prism', 'flux', 'lumen'];
+    const used = {};
+    let done = 0, progress = true;
+    while (done < cap && progress) {
+      progress = false;
+      for (let j = 0; j < order.length && done < cap; j++) {
+        const cur = order[j];
+        const c = a.cur[cur];
+        if (!c || !c.on || used[cur] === -1) continue;
+        const smart = !!SMART_CURS[cur];
+        if (smart && (!smartPerk || used[cur])) continue;
+        if (autoCraftOne(cur, smart, slotStart + (used[cur] || 0))) { used[cur] = (used[cur] || 0) + 1; done++; progress = true; }
+        else used[cur] = -1;
       }
     }
     return done;
@@ -768,6 +827,7 @@
     } else rt.aeT = 0;
     // Auto-Craft: timer with a bounded backlog (a 30s offline step makes ~3 intervals, never thousands of crafts)
     if (autoCraftOn()) {
+      rt.acClock += dt;
       rt.acT = Math.min(rt.acT + dt, AUTO.craftEvery * AUTO.craftMaxIntervals);
       let runs = 0;
       const maxRuns = headless() ? AUTO.craftMaxPerTick : AUTO.craftMaxIntervals;
@@ -1024,13 +1084,14 @@
 
   /* ------------------------------------------------------- AUTOMATION UI --- */
   // "Auto-equip" checkbox shown on several panes (Combat, Relics, Crafting). Built once, synced in syncAutoEquip().
+  function ownedUpg(id) { const T = SF.state.transcend; return !!(T && T.upg && T.upg[id] > 0); }
   function autoEquipToggle(short) {
     const cb = h('input', { type: 'checkbox' });
     cb.checked = !!autoCfg().equip;
     cb.addEventListener('change', () => { autoCfg().equip = cb.checked; rt.aeT = 1e9; /* scan on next tick */ });
     const lbl = h('label.auto-lbl', cb, short ? ' Auto-equip' : ' Auto-equip upgrades');
     tip(lbl, () => SF.perks.has('autoEquip')
-      ? '<div class="tt-title">Auto-Equip</div>Relics that raise Combat Power by more than ' + (AUTO.equipMin * 100) + '% are equipped the moment they drop (also offline), and the stash is re-checked every ' + AUTO.equipEvery + 's. Locked equipped relics are never replaced; equipped Uniques only if you allow it on the Crafting tab.'
+      ? '<div class="tt-title">Auto-Equip</div>Relics that raise Combat Power by more than ' + (AUTO.equipMin * 100) + '% are equipped the moment they drop (also offline), and the stash is re-checked every ' + AUTO.equipEvery + 's. Locked equipped relics are never replaced; equipped Uniques only if you allow it on the Crafting tab. Combat Power ignores economy stats: with <b>Keep economy relics</b> (on by default) a relic is only replaced by one with at least the same economy bonuses. Replaced relics go to the stash and are never salvaged.'
       : '<div class="tt-title">Auto-Equip (locked)</div>Reach <b>Depth 35</b> (Atlas milestone) to unlock.');
     (ui.aeToggles = ui.aeToggles || []).push({ cb, lbl });
     return lbl;
@@ -1056,22 +1117,29 @@
     uq.addEventListener('change', () => { autoCfg().equipUniques = uq.checked; });
     const uqLbl = h('label.auto-lbl', { tip: 'Allow Auto-Equip to replace an equipped Unique when a relic with more Combat Power drops. Uniques often carry economy effects that Combat Power does not measure.' }, uq, ' Replace equipped Uniques');
     ui.au.uq = { cb: uq, lbl: uqLbl };
+    const ke = h('input', { type: 'checkbox' });
+    ke.checked = a.keepEcon !== false;
+    ke.addEventListener('change', () => { autoCfg().keepEcon = ke.checked; rt.aeT = 1e9; });
+    const keLbl = h('label.auto-lbl', { tip: 'Combat Power does not count economy affixes (Stardust, Click, Shards, Echoes...). While on, Auto-Equip only replaces a relic with one whose economy bonuses are at least as high, so hand-crafted economy gear is never swapped out.' }, ke, ' Keep economy relics');
+    ui.au.ke = { cb: ke, lbl: keLbl };
     ui.au.aeHint = h('span.tiny.faint');
     const master = h('input', { type: 'checkbox' });
     master.checked = !!a.craft;
     master.addEventListener('change', () => { autoCfg().craft = master.checked; });
     const masterLbl = h('label.auto-lbl', master, ' Auto-craft equipped relics');
     tip(masterLbl, () => SF.perks.has('autoCraft')
-      ? '<div class="tt-title">Auto-Craft</div>Every ' + AUTO.craftEvery + 's of game time (also offline) up to ' + AUTO.craftPerInterval + ' currencies are used on your <b>equipped</b>, non-unique, uncorrupted relics. Voidstone and Riftseed are never used automatically. Amounts at or below the reserve are never spent.'
-      : '<div class="tt-title">Auto-Craft (locked)</div>Buy the Echo upgrade <b>Artificer\'s Workshop</b> (Transcendence → Automation).');
+      ? '<div class="tt-title">Auto-Craft</div>Every ' + AUTO.craftEvery + 's of game time (also offline) up to ' + AUTO.craftPerInterval + ' currencies (taking turns, at most one Lumen and one Flux) are used on your <b>equipped</b>, non-unique, uncorrupted relics. Voidstone and Riftseed are never used automatically. Amounts at or below the reserve are never spent.'
+      : ownedUpg('workshop')
+        ? '<div class="tt-title">Auto-Craft (off)</div>You own <b>Artificer\'s Workshop</b>, but it is switched off in Transcendence → Automation.'
+        : '<div class="tt-title">Auto-Craft (locked)</div>Buy the Echo upgrade <b>Artificer\'s Workshop</b> (Transcendence → Automation).');
     ui.au.master = { cb: master, lbl: masterLbl };
     ui.au.acHint = h('span.tiny.faint');
     const rowsEl = h('div.au-curs');
     const DESC = {
       ascendant: 'Upgrades Normal → Magic → Rare.',
       prism: 'Adds an affix while there is room.',
-      flux: 'Rerolls the affixes; undone if Combat Power drops.',
-      lumen: 'Rerolls every value; undone if Combat Power drops.',
+      flux: 'Rerolls the affixes; undone if Combat Power or economy drops.',
+      lumen: 'Rerolls every value; undone if Combat Power or economy drops.',
     };
     for (const id of AUTO_CURS) {
       const c = I.CUR_BY_ID[id];
@@ -1086,7 +1154,8 @@
       const row = h('div.au-row', lbl, h('span.tiny.muted.au-desc', DESC[id]), h('span.small.muted', 'Owned ', own), h('span.small.muted.au-keep-l', 'Keep ≥ ', keep));
       tip(row, () => {
         let t = '<div class="tt-title" style="color:' + c.color + '">' + c.icon + ' Auto-' + c.name + '</div><div>' + DESC[id] + '</div><div class="small muted">Never spends below the reserve (Keep ≥).</div>';
-        if (SMART_CURS[id] && !SF.perks.has('autoCraftSmart')) t += '<div class="tt-sep"></div><div class="bad small">Requires the Echo upgrade <b>Artificer\'s Eye</b>: without it a reroll could make your relic worse.</div>';
+        if (SMART_CURS[id]) t += '<div class="small muted">Undone if Combat Power or economy bonuses drop. Never used on locked relics; a relic that keeps failing to improve is rested for a while.</div>';
+        if (SMART_CURS[id] && !SF.perks.has('autoCraftSmart')) t += '<div class="tt-sep"></div><div class="bad small">' + (ownedUpg('eye') ? 'You own <b>Artificer\'s Eye</b>, but it is switched off in Transcendence → Automation.' : 'Requires the Echo upgrade <b>Artificer\'s Eye</b>: without it a reroll could make your relic worse.') + '</div>';
         return t;
       });
       ui.au.rows[id] = { cb, keep, own, lbl, row };
@@ -1096,7 +1165,7 @@
     ui.au.log = h('div.au-log');
     ui.au.logSig = '';
     return h('div.panel.au-panel', h('div.panel-title', '⚙ Automation'),
-      h('div.au-sec', h('div.row.gap.wrap', ae, uqLbl, ui.au.aeHint)),
+      h('div.au-sec', h('div.row.gap.wrap', ae, uqLbl, keLbl, ui.au.aeHint)),
       h('div.divider'),
       h('div.au-sec', h('div.row.gap.wrap', masterLbl, ui.au.acHint), rowsEl),
       ui.au.status, ui.au.log);
@@ -1109,12 +1178,16 @@
     if (ui.au.uq.cb.checked !== !!a.equipUniques) ui.au.uq.cb.checked = !!a.equipUniques;
     ui.au.uq.cb.disabled = !hasE;
     SF.ui.setClass(ui.au.uq.lbl, 'locked', !hasE);
+    if (ui.au.ke.cb.checked !== (a.keepEcon !== false)) ui.au.ke.cb.checked = a.keepEcon !== false;
+    ui.au.ke.cb.disabled = !hasE;
+    SF.ui.setClass(ui.au.ke.lbl, 'locked', !hasE);
     SF.ui.setText(ui.au.aeHint, hasE ? '' : '🔒 Unlocks at Rift Depth 35 (Atlas milestone)');
     if (ui.au.master.cb.checked !== !!a.craft) ui.au.master.cb.checked = !!a.craft;
     ui.au.master.cb.disabled = !hasC;
     SF.ui.setClass(ui.au.master.lbl, 'locked', !hasC);
     SF.ui.setClass(ui.au.master.lbl, 'auto-on', hasC && !!a.craft);
-    SF.ui.setText(ui.au.acHint, !hasC ? "🔒 Echo upgrade: Artificer's Workshop" : !smart ? "Lumen & Flux need Artificer's Eye" : '');
+    SF.ui.setText(ui.au.acHint, !hasC ? (ownedUpg('workshop') ? "Artificer's Workshop is switched off in Transcendence → Automation" : "🔒 Echo upgrade: Artificer's Workshop")
+      : !smart ? (ownedUpg('eye') ? "Artificer's Eye is switched off in Transcendence → Automation" : "Lumen & Flux need Artificer's Eye") : '');
     for (const id of AUTO_CURS) {
       const r = ui.au.rows[id], c = a.cur[id];
       const locked = !hasC || (SMART_CURS[id] && !smart);
@@ -1765,8 +1838,8 @@
       h('div.panel.craft-pick', h('div.panel-title', 'Choose a Relic'), ui.cList),
       h('div.col',
         h('div.panel.panel-glow', h('div.panel-title', 'Crafting Bench'), h('div.bench-wrap', ui.cBench, ui.cCurs)),
-        h('div.panel', h('div.panel-title', 'Result'), ui.cResult),
-        buildAutomationPanel())));
+        buildAutomationPanel(),
+        h('div.panel', h('div.panel-title', 'Result'), ui.cResult))));
     ui.cListSig = '';
     ui.cBenchSig = '';
     renderResult();

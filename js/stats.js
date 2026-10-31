@@ -549,7 +549,7 @@
 <li>Monsters drop <b>Relics</b> for six slots: Weapon, Armor, Helm, Ring, Amulet, Charm. Rarities: <span class="r-normal">Normal</span>, <span class="r-magic">Magic</span>, <span class="r-rare">Rare</span> and <span class="r-unique">Unique</span> (boss-only, with special effects).</li>
 <li>Many affixes boost the <b>economy</b> — Stardust, clicks, shards — so good gear speeds up everything, not just combat.</li>
 <li>Depth milestones grant Star Points and permanent bonuses, including Auto-Push at depth 15, advanced Auto-Salvage at 25 and <b>Auto-Equip</b> at 35.</li>
-<li><b>Auto-Equip</b> wears any relic that raises Combat Power by more than 1% the moment it drops (offline too) and re-checks your stash every few seconds. It never replaces a locked relic, nor an equipped Unique unless you allow it. Toggle it on the Combat, Relics or Crafting tab.</li>
+<li><b>Auto-Equip</b> wears any relic that raises Combat Power by more than 1% the moment it drops (offline too) and re-checks your stash every few seconds. It never replaces a locked relic, nor an equipped Unique unless you allow it. With <i>Keep economy relics</i> (on by default) it never trades economy bonuses for Combat Power, and the relic it replaces always goes to your stash, never to salvage. Toggle it on the Combat, Relics or Crafting tab.</li>
 <li>When a single Warden hit deals 1,000× a monster's life, the Warden <b>Overwhelms</b> the depth: only 3 kills to clear and packs arrive faster. Climbing back after a Transcendence is quick; the real frontier is where you stop one-shotting.</li></ul>
 <p class="hint">Compare items by hovering — the tooltip shows the difference against what you have equipped.</p>` },
     { id: 'crafting', title: 'Crafting', icon: '🔨', unlocked: riftsOpen, body: `
@@ -559,7 +559,7 @@
 <li><b>Prism</b> — add an affix. <b>Voidstone</b> — remove a random one.</li>
 <li><b>Ascendant Orb</b> — raise rarity; on a Rare, push an affix up a tier.</li>
 <li><b>Riftseed</b> — <span class="bad">corrupt</span> the relic: a big random change, good or bad. Corrupted relics can never be crafted again.</li></ul>
-<p><b>Auto-Craft</b> (Echo upgrade <i>Artificer's Workshop</i>) spends Ascendant Orbs and Prisms on your <b>equipped</b>, non-unique, uncorrupted relics every 10s, keeping the reserve you set for each currency. <i>Artificer's Eye</i> adds Lumen and Flux in a safe mode: a reroll that lowers Combat Power is undone (the currency is still spent). Voidstone and Riftseed are never used automatically. Configure it in the Automation panel of the Crafting tab.</p>
+<p><b>Auto-Craft</b> (Echo upgrade <i>Artificer's Workshop</i>) spends Ascendant Orbs and Prisms on your <b>equipped</b>, non-unique, uncorrupted relics every 10s, keeping the reserve you set for each currency. <i>Artificer's Eye</i> adds Lumen and Flux in a safe mode: a reroll that lowers Combat Power or economy bonuses is undone (the currency is still spent), locked relics are never rerolled, and a relic that keeps failing to improve is rested for a while. Voidstone and Riftseed are never used automatically. Configure it in the Automation panel of the Crafting tab.</p>
 <p>Salvage unwanted relics for <b class="c-riftdust">Rift Dust</b> and spend it in the Rift Shop on currency and stash space. Set auto-salvage rules so your stash never fills up.</p>
 <p class="hint">Higher item level unlocks higher affix tiers. Craft on relics from deep depths.</p>` },
     { id: 'transcend', title: 'Transcendence', icon: '❂', unlocked: transOpen, body: `

@@ -767,7 +767,7 @@
   }
   /**
    * Greedily equip the stash relic with the biggest combat-power gain in every slot. Returns number of swaps.
-   * opts (optional, used by Auto-Equip): {skipSlot(slot) -> bool, onSwap(item, prev, gain)}.
+   * opts (optional, used by Auto-Equip): {skipSlot(slot) -> bool, accept(item, prev) -> bool, onSwap(item, prev, gain)}.
    */
   function equipBest(minGain, opts) {
     const st = R();
@@ -779,8 +779,10 @@
       for (const slot of SLOTS) {
         if (opts.skipSlot && opts.skipSlot(slot)) continue;
         let best = null, bestD = thr;
+        const cur = st.equipped[slot];
         for (const it of st.inventory) {
           if (it.slot !== slot) continue;
+          if (opts.accept && !opts.accept(it, cur)) continue;
           const d = powerDelta(it);
           if (d > bestD) { bestD = d; best = it; }
         }

@@ -103,12 +103,13 @@ Other stats:
   - "Keep upgrades" skips relics that would raise combat power by more than 1% (checked live only).
   - Uniques are never auto-salvaged. Relics from comets and caches are not auto-salvaged.
 - **Auto-Equip** (perk `autoEquip`, Depth 35 milestone; toggle `auto.equip`, default on, shown on the Combat, Relics and Crafting panes):
-  - Every received relic (rift drops, comets, caches) is compared with the equipped one **before** the auto-salvage rules run. If it raises Combat Power by more than `AUTO.equipMin` (1%), it is equipped at once. This also happens headless/offline, where the "keep upgrades" salvage check is skipped. If the replaced relic overfills the stash it is salvaged (never if locked or Unique).
-  - A full stash scan (`I.equipBest(1%, {skipSlot, onSwap})`) runs every 5s of live game time when the stash, gear or level changed (at least every 60s), and every 1800s while headless.
+  - Every received relic (rift drops, comets, caches) is compared with the equipped one **before** the auto-salvage rules run. If it raises Combat Power by more than `AUTO.equipMin` (1%), it is equipped at once. This also happens headless/offline, where the "keep upgrades" salvage check is skipped. The replaced relic always goes to the stash and is **never salvaged**: the stash may overflow by up to 20 (the same allowance Uniques get); beyond that the drop is not auto-equipped and the normal rules apply to it.
+  - **Keep economy relics** (`auto.keepEcon`, default on): Combat Power ignores economy affixes, so a relic is only replaced by one whose `I.econScore` is at least as high (`equipBest` takes an `accept(item, prev)` filter). This guard does not apply to an equipped Unique while "Replace equipped Uniques" is on (an explicit opt-in).
+  - A full stash scan (`I.equipBest(1%, {skipSlot, accept, onSwap})`) runs every 5s of live game time when the stash, gear or level changed (at least every 60s), and every 1800s while headless.
   - Never replaces a **locked** equipped relic. Equipped **Uniques** are kept unless `auto.equipUniques` ("Replace equipped Uniques") is on.
   - Live swaps produce one merged toast at most every 4s. Counted in `stats.autoEquips`.
 - **Auto-Craft** (perk `autoCraft` from the Echo upgrade *Artificer's Workshop*; perk `autoCraftSmart` from *Artificer's Eye*). Master toggle `auto.craft`. It is configured in the **Automation** panel on the Crafting sub-tab.
-  - Every `AUTO.craftEvery` (10s) of game time it uses up to `AUTO.craftPerInterval` (3) currencies on **equipped, non-unique, uncorrupted** relics. The starting slot rotates. Live, up to 6 intervals can be banked; headless, one interval is resolved per tick, so a ~30s offline step does at most 3 crafts.
+  - Every `AUTO.craftEvery` (10s) of game time it uses up to `AUTO.craftPerInterval` (3) currencies on **equipped, non-unique, uncorrupted** relics. Currencies take turns (round-robin): Ascendant Orb, then Prism, then Flux and Lumen (these two alternate which goes first, and each gets at most one craft per interval), so no currency can starve the others. The starting slot rotates. Live, up to 6 intervals can be banked; headless, one interval is resolved per tick, so a ~30s offline step does at most 3 crafts.
   - Priority and defaults:
 
     | Currency | Use | Default | Reserve (`keep`) |
@@ -118,7 +119,8 @@ Other stats:
     | Flux | reroll affixes (Magic/Rare) | off, needs `autoCraftSmart` | 10 |
     | Lumen | reroll values | off, needs `autoCraftSmart` | 10 |
 
-  - Flux and Lumen are "safe": the item is snapshotted, and if `computeWarden().power` drops after the craft the snapshot is restored (the currency stays spent; counted in `stats.autoCraftReverts`).
+  - Flux and Lumen are "safe": the item is snapshotted, and if `computeWarden().power` **or** the relic's `I.econScore` drops after the craft the snapshot is restored (the currency stays spent; counted in `stats.autoCraftReverts`). They never touch **locked** relics.
+  - Back-off: after `AUTO.smartStrikes` (4) Flux/Lumen crafts in a row that do not improve a relic (reverted or unchanged), that currency rests on that relic for `AUTO.smartRest` (300s) of game time, doubling each time up to 6h; an improving craft resets it (runtime only, not saved). This keeps a near-perfect relic from burning the whole stock down to the reserve, and keeps offline catch-up cheap.
   - A currency is only used while owned > reserve. Voidstone and Riftseed are never used automatically.
   - Uses `I.craft`, so `stats.crafts`, the `craft` event and the crafting achievements count auto-crafts too. Auto-crafts are also counted separately in `stats.autoCrafts`.
   - `auto.log` keeps the last 8 actions (repeated actions are merged ×n). The panel shows 5 of them.
