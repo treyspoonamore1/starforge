@@ -98,12 +98,17 @@ Other stats:
   - Lock relics; locked relics are never salvaged.
   - Salvage one relic or in bulk (unlocked ≤ rarity).
   - **Salvage value** = `rarityBase(1/3/9/40) × (1+ilvl/15) × 1.5 if corrupted × (1+riftDust%) × milestone`.
-- **Auto-salvage rules:**
-  - Normal is on by default and always available. The Magic and Rare rules need perk `autoSalvage`, which the Depth 25 milestone also grants.
-  - "Keep upgrades" skips relics that would raise combat power by more than 1% (checked live only).
-  - Uniques are never auto-salvaged. Relics from comets and caches are not auto-salvaged.
+- **Auto-salvage rules** (`state.rifts.salvage`, Relics sub-tab under the stash):
+  - Normal is on by default and always available. The Magic and Rare rules need perk `autoSalvage`, granted by the Depth 25 Atlas milestone (milestones are claimed automatically when `bestEver` reaches the depth; there is no claim button). Locked rules are disabled from the first render, can't be flipped on by a click, and `salvageTick` forces `magic`/`rare` back to false while the perk is missing (old saves, UI races). The hint next to the rules says how to unlock them.
+  - One predicate, `autoSalvageOk(it, drop)`, is used for drops and stash sweeps. It **never** salvages: Uniques, 🔒 locked relics, equipped relics, relics that were worn before (`it.worn`, set by `I.equip`/`I.unequip` when a relic leaves a slot — so gear swapped out manually or by Auto-Equip, including relics Auto-Craft worked on, is never melted), corrupted relics, hand-crafted relics (`it.crafted`, set by manual crafting at the bench), Sealed Relic Cache relics (`it.bought`). Sweeps also skip the relic open in the detail panel (`ui.sel`) and on the Crafting bench (`ui.craftSel`). **Keep upgrades** protects only the best upgrade (> `AUTO.salvageKeepMin` = 1% Combat Power) per slot; weaker same-slot upgrades count as junk. **Keep economy relics** (`auto.keepEcon`) applies only once perk `autoEquip` makes that toggle usable, and protects only the best relic per slot whose `I.econScore` beats the equipped one. Both are computed per stash/gear version in `salvageKeepCtx()`; a drop is kept if it would beat the current best.
+  - **Drops:** only rift drops (`source 'rift'`) are auto-salvaged on arrival. Comet relics land in the stash first (and are then subject to sweeps); cache relics are protected. For drops received while headless the Keep-upgrades check is skipped (cost), as before; Auto-Equip runs first.
+  - **Stash sweep** (`autoSalvageSweep()`): right away when a rule is turned on (or Keep upgrades off) in the UI, then every `AUTO.salvageEvery` (5s) of live game time / `AUTO.salvageEveryHeadless` (600s) headless, only when the stash, gear, level or rules changed. Keep-upgrades is re-evaluated against current gear, so stale "upgrades" are cleaned once something better is worn.
+  - **First sweep:** per rule (`salvage.confirmed[rule]`), the first time turning it on in the UI would sweep stash relics — any for Magic/Rare, ≥ 5 for Normal / Keep upgrades off — a confirmation lists the count and Rift Dust (Cancel leaves the rule off). Background sweeps never consume this. A first sweep that happens on its own (e.g. offline, old saves with the Normal rule on) sets `salvage.noticed` and shows a one-time toast instead, once live, explaining the stash cleanup and that 🔒 lock protects relics. Offline sweeps never wait on a dialog.
+  - **Feedback:** a line under the rules reads "Auto-salvaged: N relics (+X Rift Dust) this session · total N (+X)" (`SF.rifts.salvageSession()`, `stats.autoSalvaged`, `stats.autoSalvageDust`). All auto-salvages are logged in the drop log; consecutive ones of the same rarity merge into one "N× Normal relics" row (`log[].c`; `h: 'salvaged'` for drops, `'swept'` for the stash). Live stash sweeps produce at most one toast every `AUTO.salvageToastEvery` (10s), only on the Rifts tab. The welcome-back modal reports offline auto-salvages.
+  - Counted in `stats.autoSalvaged` (and, as before, `stats.salvaged`). Rift Sifter's 20% currency chance applies to Magic/Rare relics from sweeps too.
+  - Bulk buttons "Salvage unlocked: Normal / ≤ Magic / ≤ Rare" are manual (confirmation) and salvage every unlocked non-Unique relic of that rarity or lower, regardless of the rules.
 - **Auto-Equip** (perk `autoEquip`, Depth 35 milestone; toggle `auto.equip`, default on, shown on the Combat, Relics and Crafting panes):
-  - Every received relic (rift drops, comets, caches) is compared with the equipped one **before** the auto-salvage rules run. If it raises Combat Power by more than `AUTO.equipMin` (1%), it is equipped at once. This also happens headless/offline, where the "keep upgrades" salvage check is skipped. The replaced relic always goes to the stash and is **never salvaged**: the stash may overflow by up to 20 (the same allowance Uniques get); beyond that the drop is not auto-equipped and the normal rules apply to it.
+  - Every received relic (rift drops, comets, caches) is compared with the equipped one **before** the auto-salvage rules run. If it raises Combat Power by more than `AUTO.equipMin` (1%), it is equipped at once. This also happens headless/offline, where the "keep upgrades" salvage check is skipped. The replaced relic always goes to the stash, is flagged `worn` and is **never auto-salvaged**: the stash may overflow by up to 20 (the same allowance Uniques get); beyond that the drop is not auto-equipped and the normal rules apply to it.
   - **Keep economy relics** (`auto.keepEcon`, default on): Combat Power ignores economy affixes, so a relic is only replaced by one whose `I.econScore` is at least as high (`equipBest` takes an `accept(item, prev)` filter). This guard does not apply to an equipped Unique while "Replace equipped Uniques" is on (an explicit opt-in).
   - A full stash scan (`I.equipBest(1%, {skipSlot, accept, onSwap})`) runs every 5s of live game time when the stash, gear or level changed (at least every 60s), and every 1800s while headless.
   - Never replaces a **locked** equipped relic. Equipped **Uniques** are kept unless `auto.equipUniques` ("Replace equipped Uniques") is on.
@@ -169,16 +174,16 @@ Depth 49 @1h, 108 @3h, ~200 @7h, ~300 @13h, ~400 @48h. Walls get progressively h
   hp /* -1 = full */, atk, pushDeaths, retry, retryTimer, autoPush, level, xp,
   riftDust, cur:{flux,lumen,prism,voidstone,ascendant,riftseed}, capBought, cacheBought,
   inventory:[item], equipped:{weapon,armor,helm,ring,amulet,charm: item|null},
-  salvage:{normal,magic,rare,keepUpgrades}, claimed:{depth:true}, bossFirst:{depth:n}, codex:{uniqueId:n},
+  salvage:{normal,magic,rare,keepUpgrades,noticed}, claimed:{depth:true}, bossFirst:{depth:n}, codex:{uniqueId:n},
   pendingPoints, pointsGranted, stats:{kills,eliteKills,bossKills,deaths,items:{normal,magic,rare,unique},salvaged,
-  autoSalvaged,riftDustEarned,crafts,corrupts,curFound,time,highestHit,overflow,autoEquips,autoCrafts,autoCraftReverts},
+  autoSalvaged,riftDustEarned,crafts,corrupts,curFound,time,highestHit,overflow,autoEquips,autoCrafts,autoCraftReverts,autoSalvageDust},
   log:[last 20 drops],
   auto:{equip:true, equipUniques:false, craft:true,
         cur:{ascendant:{on:true,keep:1}, prism:{on:true,keep:2}, flux:{on:false,keep:10}, lumen:{on:false,keep:10}},
         log:[{t,x,k:'equip'|'craft'|'revert',n}]},
   ui:{...} }
 ```
-Item: `{id, base, slot, ilvl, rarity, name, rname?, uniq?, imp:{stat,r,v}, cimp?:{stat,r,v}, affixes:[{id,k,r,v}], umods?:[{stat,r,v}], corrupted, cor?, locked, isNew, t}`.
+Item: `{id, base, slot, ilvl, rarity, name, rname?, uniq?, imp:{stat,r,v}, cimp?:{stat,r,v}, affixes:[{id,k,r,v}], umods?:[{stat,r,v}], corrupted, cor?, locked, crafted? /* manual craft: never auto-salvaged */, bought? /* Sealed Relic Cache */, isNew, t}`.
 
 **Transcend reset** (`SF.resets.register('transcend')`):
 - **Reset:** depth → 1, maxCleared and runBest → 0, the fight state is cleared.
@@ -221,7 +226,7 @@ The offline welcome-back modal gets lines for kills, bosses, relics, uniques, cu
 - **Loot and points:** `receiveItem(item, {source})`, `addItem(item)`, `grantPoints(n, reason)`
 - **Milestones:** `milestoneMult(key)`, `milestoneList()`, `nextMilestone()`
 - **Shop:** `buyCurrency(id, n)`, `buyCapacity()`, `buyCache()`, `capCost()`, `cacheCost()`
-- **Automation:** `AUTO` (tunables), `autoEquipOn()`, `autoCraftOn()`, `autoEquipScan()`, `autoCraftRun(cap)` (one interval, returns crafts made), `autoCanReplace(slot)`
+- **Automation:** `AUTO` (tunables), `autoEquipOn()`, `autoCraftOn()`, `autoEquipScan()`, `autoCraftRun(cap)` (one interval, returns crafts made), `autoCanReplace(slot)`, `autoSalvageOk(item)` (would a stash sweep salvage it?), `autoSalvagePreview()` (→ `{n, dust, ids}`), `autoSalvageSweep()` (→ `{n, gained}`), `salvageSession()` (→ `{n, dust}` since page load)
 - **Misc:** `isUnlocked()`, `unlock()` (debug/testing), `dps()` (measured), `BAL`, `BANDS`, `MILESTONES`
 
 `SF.items`:

@@ -232,6 +232,7 @@ async function visitAllTabs(page, tag) {
     SF.rifts.autoEquipScan();
     r.uniqueKept = st.equipped[uq.slot].id === uq.id;
     st.auto.equipUniques = true;
+    r.betterDelta = st.inventory.includes(better) ? I.powerDelta(better) : 0; // re-measure: the first scan may have changed other slots
     SF.rifts.autoEquipScan();
     r.uniqueReplacedWhenAllowed = st.equipped[uq.slot].id !== uq.id;
     st.auto.equipUniques = false;
@@ -347,6 +348,179 @@ async function visitAllTabs(page, tag) {
   check('Workshop toggled off in Transcendence disables Auto-Craft', au.toggledOffPerk === false, au);
   check('smart auto-craft never lowers Combat Power or economy', au.smartRuns > 0 && au.smartWorse === 0 && au.pEnd >= au.pStart && au.smartReserve, au);
   check('automation log written', au.log > 0, au);
+
+  section('Rifts — Auto-Salvage (stash sweep)');
+  const asv = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, r = {};
+    window._asv = { snapSalv: Object.assign({}, st.salvage), snapAuto: { equip: st.auto.equip, keepEcon: st.auto.keepEcon } };
+    st.auto.equip = false; st.auto.keepEcon = true;
+    Object.assign(st.salvage, { normal: false, magic: false, rare: false, keepUpgrades: true, noticed: true });
+    // room in the stash
+    I.salvage(st.inventory.filter((x) => !x.locked && x.rarity !== 'unique').map((x) => x.id));
+    const junk = (slot) => { for (let i = 0; i < 400; i++) { const x = I.generate(2, 'normal', slot ? { slot } : undefined); if (I.powerDelta(x) <= 0.005 && I.econScore(x) <= 0) return x; } return null; };
+    const add = (x) => { I._rawAdd(x, { force: true }); return x.id; };
+    const ids = { junk: [] };
+    for (let i = 0; i < 8; i++) { const x = junk(); if (x) ids.junk.push(add(x)); }
+    let x = junk(); x.locked = true; ids.locked = add(x);
+    x = junk(); x.corrupted = true; x.cor = 'nothing'; ids.corrupted = add(x);
+    x = junk(); x.crafted = true; ids.crafted = add(x);
+    x = I.generate(10, 'unique'); ids.unique = add(x);
+    // an upgrade: empty the weapon slot, any normal weapon is then a Combat Power upgrade
+    window._asv.weapon = st.equipped.weapon; st.equipped.weapon = null; I.bump();
+    for (let i = 0; i < 200; i++) { x = I.generate(Math.max(30, st.maxCleared + 20) + Math.floor(i / 20) * 15, i < 100 ? 'normal' : 'magic', { slot: 'weapon' }); if (I.powerDelta(x) > 0.02) break; }
+    r.upDelta = I.powerDelta(x); ids.upgrade = add(x);
+    // economy relic (Keep economy relics): beats the equipped relic's economy score in its slot
+    let eco = null;
+    for (let i = 0; i < 3000 && !eco; i++) { const y = I.generate(Math.max(5, st.maxCleared), 'normal'); const p = st.equipped[y.slot]; if (y.slot !== 'weapon' && I.econScore(y) > (p ? I.econScore(p) : 0) + 0.01 && I.powerDelta(y) <= 0.01
+      && !st.inventory.some((z) => z.slot === y.slot && I.econScore(z) >= I.econScore(y))) eco = y; } // the best economy relic for its slot
+    r.ecoTested = !!eco; if (eco) ids.eco = add(eco);
+    // an equipped junk relic in the weapon slot is never swept either (sweeps only look at the stash)
+    window._asv.ids = ids;
+    r.n0 = st.stats.autoSalvaged; r.d0 = st.stats.autoSalvageDust || 0;
+    r.junk = ids.junk.length;
+    r.previewOffAll = SF.rifts.autoSalvagePreview().n;
+    return r;
+  });
+  check('auto-salvage test relics prepared', asv.junk >= 6 && asv.upDelta > 0.01 && asv.previewOffAll === 0, asv);
+  // enabling the Normal rule in the UI sweeps the existing stash immediately
+  await page.evaluate(() => { SF.ui.switchTab('rifts'); });
+  await page.waitForTimeout(200);
+  await page.evaluate(() => { const b = document.querySelectorAll('section.tab-pane[data-tab="rifts"] .subtabs .subtab')[1]; if (b) b.click(); });
+  await page.waitForTimeout(300);
+  await page.evaluate(() => { const cb = document.querySelector('.auto-rules label.r-normal input'); cb.click(); });
+  await page.waitForTimeout(150);
+  if (await page.$('.modal .btn-primary')) await page.click('.modal .btn-primary');
+  await page.waitForTimeout(150);
+  const asv2 = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, ids = window._asv.ids, r = {};
+    const has = (id) => st.inventory.some((x) => x.id === id) || I.isEquipped(id);
+    r.rule = st.salvage.normal;
+    r.junkLeft = ids.junk.filter(has).length;
+    r.kept = { locked: has(ids.locked), corrupted: has(ids.corrupted), crafted: has(ids.crafted), unique: has(ids.unique), upgrade: has(ids.upgrade), eco: ids.eco ? has(ids.eco) : true };
+    r.counted = st.stats.autoSalvaged - 0; r.dust = st.stats.autoSalvageDust;
+    r.ses = SF.rifts.salvageSession();
+    const el = document.querySelector('.salv-stat'); r.statText = el ? el.innerText : '';
+    r.logSwept = st.log.some((e) => e.h === 'swept');
+    // upgrades are re-evaluated at sweep time: once a better weapon is worn, the old "upgrade" goes
+    const w = window._asv.weapon || I.generate(60, 'rare', { slot: 'weapon' });
+    st.equipped.weapon = w; I.bump();
+    r.upNow = I.powerDelta(I.findItem(ids.upgrade));
+    return r;
+  });
+  check('enabling the Normal rule sweeps existing normal relics', asv2.rule && asv2.junkLeft === 0 && asv2.logSwept, asv2);
+  check('sweep keeps locked/unique/corrupted/hand-crafted/upgrade/economy relics', Object.values(asv2.kept).every(Boolean), asv2);
+  check('auto-salvage counters + UI feedback', asv2.ses.n >= asv.junk && asv2.dust > asv.d0 && /Auto-salvaged: \d/.test(asv2.statText), asv2);
+  const asv3 = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, ids = window._asv.ids, r = {};
+    const has = (id) => st.inventory.some((x) => x.id === id);
+    // headless sweep (SF.debug.advance): stale upgrade + fresh junk are cleaned, protected relics stay
+    const fresh = [];
+    for (let i = 0; i < 5; i++) { for (let k = 0; k < 400; k++) { const x = I.generate(2, 'normal'); if (I.powerDelta(x) <= 0.005 && I.econScore(x) <= 0) { I._rawAdd(x, { force: true }); fresh.push(x.id); break; } } }
+    const n0 = st.stats.autoSalvaged;
+    SF.debug.advance(SF.rifts.AUTO.salvageEveryHeadless + 20, 10);
+    r.freshLeft = fresh.filter(has).length; r.fresh = fresh.length;
+    r.staleUpgradeGone = !has(ids.upgrade);
+    r.protected = has(ids.locked) && has(ids.corrupted) && has(ids.crafted) && has(ids.unique);
+    r.more = st.stats.autoSalvaged > n0;
+    // Magic rule cannot be enabled before the Depth 25 perk
+    delete st.claimed[25]; SF.mods.invalidate();
+    r.perkOff = !SF.perks.has('autoSalvage');
+    return r;
+  });
+  check('auto-salvage sweeps headlessly in SF.debug.advance (incl. stale upgrades)', asv3.fresh >= 3 && asv3.freshLeft === 0 && asv3.staleUpgradeGone && asv3.protected && asv3.more, asv3);
+  await page.waitForTimeout(300); // let the Relics pane update
+  const asv4 = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, r = {};
+    const cb = document.querySelector('.auto-rules label.r-magic input');
+    r.disabled = cb.disabled;
+    cb.disabled = false; cb.click(); // force a click through (UI race)
+    r.afterClick = st.salvage.magic;
+    st.salvage.magic = true; // e.g. an old save
+    SF.debug.advance(1, 1);
+    r.afterTick = st.salvage.magic;
+    const m = I.generate(2, 'magic'); I._rawAdd(m, { force: true });
+    r.magicKept = !SF.rifts.autoSalvageOk(m);
+    I.salvage([m.id]);
+    st.claimed[25] = true; SF.mods.invalidate();
+    // restore
+    const ids = window._asv.ids;
+    for (const k of ['locked', 'crafted']) { const it = I.findItem(ids[k]); if (it) it.locked = false; }
+    I.salvage([ids.locked, ids.corrupted, ids.crafted, ids.upgrade, ids.eco].filter(Boolean));
+    Object.assign(st.salvage, window._asv.snapSalv);
+    Object.assign(st.auto, window._asv.snapAuto);
+    return r;
+  });
+  check('Magic rule cannot be enabled before the Depth 25 perk', asv3.perkOff && asv4.disabled && asv4.afterClick === false && asv4.afterTick === false && asv4.magicKept, asv4);
+
+  // reviewer regressions: bench/detail selection, swapped-out gear, dominated upgrades, econ guard before Auto-Equip,
+  // per-rule first-sweep confirmation not consumed by background sweeps
+  const asv5 = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, r = {};
+    window._asv5 = { snapSalv: JSON.parse(JSON.stringify(st.salvage)), snapAuto: { equip: st.auto.equip, keepEcon: st.auto.keepEcon }, ui: { sel: st.ui.sel, craftSel: st.ui.craftSel } };
+    st.auto.equip = false; st.auto.keepEcon = true;
+    Object.assign(st.salvage, { normal: true, magic: false, rare: false, keepUpgrades: true, noticed: true });
+    I.salvage(st.inventory.filter((x) => !x.locked && x.rarity !== 'unique').map((x) => x.id));
+    const junk = (rar, slot) => { for (let i = 0; i < 600; i++) { const x = I.generate(2, rar || 'normal', slot ? { slot } : undefined); if (I.powerDelta(x) <= 0.005 && I.econScore(x) <= 0) return x; } return null; };
+    const add = (x) => { I._rawAdd(x, { force: true }); return x.id; };
+    const has = (id) => st.inventory.some((x) => x.id === id);
+    const j1 = add(junk()), j2 = add(junk());
+    st.ui.craftSel = j1; st.ui.sel = j2;
+    // swapped-out gear: wear a junk armor, then swap the old armor back -> junk armor returns to the stash as worn
+    const curA = st.equipped.armor;
+    const wa = junk('normal', 'armor'); add(wa); I.equip(wa.id); if (curA) I.equip(curA.id); else I.unequip('armor');
+    r.wornFlag = !!wa.worn;
+    // dominated same-slot upgrades: only the best is kept
+    r.weapon = st.equipped.weapon; st.equipped.weapon = null; I.bump();
+    const ups = [];
+    for (let i = 0; i < 200 && ups.length < 2; i++) { const x = I.generate(Math.max(30, st.maxCleared + 20), 'normal', { slot: 'weapon' }); const d = I.powerDelta(x); if (d > 0.02 && I.econScore(x) <= 0 && !ups.some((u) => Math.abs(I.powerDelta(u) - d) < 0.01)) ups.push(x); }
+    ups.sort((a, b) => I.powerDelta(b) - I.powerDelta(a));
+    ups.forEach(add);
+    // economy guard is inactive before the Auto-Equip perk (its toggle is locked then)
+    const had35 = !!st.claimed[35]; delete st.claimed[35]; SF.mods.invalidate();
+    r.perkE = SF.perks.has('autoEquip');
+    let eco = null;
+    for (let i = 0; i < 3000 && !eco; i++) { const y = I.generate(Math.max(5, st.maxCleared), 'normal'); const p = st.equipped[y.slot]; if (y.slot !== 'weapon' && I.econScore(y) > (p ? I.econScore(p) : 0) + 0.01 && I.powerDelta(y) <= 0.01) eco = y; }
+    if (eco) add(eco);
+    SF.rifts.autoSalvageSweep();
+    r.benchKept = has(j1); r.selKept = has(j2); r.wornKept = has(wa.id);
+    r.ups = ups.length; r.bestUpKept = ups.length === 2 && has(ups[0].id); r.weakUpGone = ups.length === 2 && !has(ups[1].id);
+    r.ecoTested = !!eco; r.ecoGoneNoPerk = eco ? !has(eco.id) : true;
+    if (had35) st.claimed[35] = true; SF.mods.invalidate();
+    // deselect -> swept next time
+    st.equipped.weapon = r.weapon; I.bump(); r.weapon = null;
+    st.ui.craftSel = null; st.ui.sel = null;
+    SF.rifts.autoSalvageSweep();
+    r.benchGoneAfter = !has(j1) && !has(j2);
+    I.salvage(st.inventory.filter((x) => !x.locked && x.rarity !== 'unique').map((x) => x.id));
+    // background sweep must not use up the Magic rule's confirmation
+    st.salvage.confirmed = {}; st.salvage.noticed = false;
+    add(junk());
+    SF.debug.advance(SF.rifts.AUTO.salvageEveryHeadless + 20, 10);
+    r.noticedAfterBg = st.salvage.noticed; r.confMagic = !!st.salvage.confirmed.magic;
+    window._asv5.mag = [];
+    for (let i = 0; i < 3; i++) { const m = junk('magic'); if (m) window._asv5.mag.push(add(m)); }
+    r.mag = window._asv5.mag.length;
+    return r;
+  });
+  check('sweep keeps the relic on the Crafting bench / in the detail panel', asv5.benchKept && asv5.selKept && asv5.benchGoneAfter, asv5);
+  check('sweep keeps relics swapped out of equipment (worn)', asv5.wornFlag && asv5.wornKept, asv5);
+  check('Keep upgrades protects only the best upgrade per slot', asv5.ups < 2 || (asv5.bestUpKept && asv5.weakUpGone), asv5);
+  check('Keep economy relics does not block auto-salvage before the Auto-Equip perk', !asv5.perkE && asv5.ecoGoneNoPerk, asv5);
+  await page.waitForTimeout(300);
+  await page.evaluate(() => { const cb = document.querySelector('.auto-rules label.r-magic input'); cb.click(); });
+  await page.waitForTimeout(150);
+  const asv6 = await page.evaluate(() => ({ modal: !!document.querySelector('.modal .btn-primary'), magicOn: SF.state.rifts.salvage.magic, left: window._asv5.mag.filter((id) => SF.state.rifts.inventory.some((x) => x.id === id)).length }));
+  if (asv6.modal) await page.click('.modal .btn-primary');
+  await page.waitForTimeout(150);
+  const asv7 = await page.evaluate(() => {
+    const st = SF.state.rifts, r = {};
+    r.magicOn = st.salvage.magic; r.conf = !!(st.salvage.confirmed && st.salvage.confirmed.magic);
+    r.left = window._asv5.mag.filter((id) => st.inventory.some((x) => x.id === id)).length;
+    st.salvage = Object.assign(st.salvage, window._asv5.snapSalv);
+    Object.assign(st.auto, window._asv5.snapAuto); Object.assign(st.ui, window._asv5.ui);
+    return r;
+  });
+  check('background sweep does not consume the per-rule confirmation; Magic asks before sweeping', asv5.noticedAfterBg && !asv5.confMagic && asv5.mag >= 1 && asv6.modal && !asv6.magicOn && asv6.left === asv5.mag && asv7.magicOn && asv7.conf && asv7.left === 0, { asv5, asv6, asv7 });
 
   section('Layer 2 — Transcendence');
   await page.evaluate(() => { const need = (SF.transcend.BAL ? SF.transcend.BAL.unlockShards : 1e12) * 2; SF.state.ascension.transShards = Math.max(SF.state.ascension.transShards || 0, need); SF.debug.give('shards', need); SF.debug.advance(5); });

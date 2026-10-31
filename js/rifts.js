@@ -135,11 +135,13 @@
     level: 1, xp: 0,
     riftDust: 0, cur: CUR0(), capBought: 0, cacheBought: 0,
     inventory: [], equipped: { weapon: null, armor: null, helm: null, ring: null, amulet: null, charm: null },
-    salvage: { normal: true, magic: false, rare: false, keepUpgrades: true },
+    // noticed: the one-time "rules also clean your stash" toast was shown (background sweeps);
+    // confirmed[rule]: the player accepted (or never needed) the first-sweep confirmation for that rule
+    salvage: { normal: true, magic: false, rare: false, keepUpgrades: true, noticed: false, confirmed: {} },
     claimed: {}, bossFirst: {}, codex: {}, pendingPoints: 0, pointsGranted: 0,
     stats: { kills: 0, eliteKills: 0, bossKills: 0, deaths: 0, items: { normal: 0, magic: 0, rare: 0, unique: 0 },
       salvaged: 0, autoSalvaged: 0, riftDustEarned: 0, crafts: 0, corrupts: 0, curFound: 0, time: 0, highestHit: 0, overflow: 0,
-      autoEquips: 0, autoCrafts: 0, autoCraftReverts: 0 },
+      autoEquips: 0, autoCrafts: 0, autoCraftReverts: 0, autoSalvageDust: 0 },
     log: [],
     // Automation settings (Auto-Equip: Atlas milestone; Auto-Craft: Echo upgrades). keep = reserve never spent.
     auto: {
@@ -156,6 +158,7 @@
     fx: [], dmgAcc: 0, dmgT: 0, dpsHist: [], sessionKills: 0, sessionTime: 0, genThisTick: 0,
     wCache: null, wKey: '', lastCraft: null, offlineSnap: null, bannerT: 0, banner: null,
     aeT: 0, acT: 0, acRot: 0, acClock: 0, acBack: {}, aeToast: [], aeToastAt: 0,
+    asT: 0, asSig: '', asCtx: null, asCtxKey: '', asSes: { n: 0, dust: 0 }, asToast: { n: 0, dust: 0 }, asToastAt: 0, asNotice: null,
   };
   function pushFx(e) { if (headless()) return; rt.fx.push(e); if (rt.fx.length > 80) rt.fx.splice(0, rt.fx.length - 80); }
 
@@ -311,14 +314,123 @@
     st.log.unshift({ n: it.name, r: it.rarity, l: it.ilvl, s: it.slot, h: how || '', t: SF.core.time });
     if (st.log.length > 20) st.log.length = 20;
   }
-  function shouldAutoSalvage(it) {
+  /** Auto-salvage log entry; consecutive salvages of the same rarity merge into one row (×c) so the log is not flooded. */
+  function logSalvage(it, count, how) {
     const st = S();
-    if (it.rarity === 'unique') return false;
-    const rules = st.salvage;
-    if (!rules[it.rarity]) return false;
-    if (it.rarity !== 'normal' && !SF.perks.has('autoSalvage')) return false;
-    if (rules.keepUpgrades && !headless() && I.powerDelta(it) > 0.01) return false;
+    const top = st.log[0];
+    how = how || 'salvaged';
+    if (top && top.h === how && top.r === it.rarity && SF.core.time - (top.t || 0) < 120) {
+      // replace (not mutate) the head so the incremental drop log notices the change
+      st.log[0] = Object.assign({}, top, { n: it.name, l: it.ilvl, s: it.slot, c: (top.c || 1) + count, t: SF.core.time });
+      return;
+    }
+    st.log.unshift({ n: it.name, r: it.rarity, l: it.ilvl, s: it.slot, h: how, c: count, t: SF.core.time });
+    if (st.log.length > 20) st.log.length = 20;
+  }
+  /** Is the auto-salvage rule for this rarity active? Magic/Rare need perk autoSalvage (Atlas Depth 25). */
+  function salvRuleOn(r) {
+    const rules = S().salvage;
+    if (!rules || !rules[r] || r === 'unique') return false;
+    return r === 'normal' || SF.perks.has('autoSalvage');
+  }
+  /**
+   * Per-slot keep candidates in the stash, cached per stash/gear version: the single best Combat Power
+   * upgrade (Keep upgrades) and the single best economy relic that beats the worn one (Keep economy relics,
+   * only once Auto-Equip's perk makes that toggle usable). Dominated same-slot relics count as junk.
+   */
+  function salvageKeepCtx() {
+    const st = S();
+    const econOn = SF.perks.has('autoEquip') && autoCfg().keepEcon !== false;
+    const key = I._invVer + '|' + I.gearVer + '|' + st.level + '|' + (econOn ? 1 : 0) + '|' + (st.salvage.keepUpgrades ? 1 : 0);
+    if (rt.asCtx && rt.asCtxKey === key) return rt.asCtx;
+    const up = {}, econ = {};
+    for (const it of st.inventory) {
+      if (!it) continue;
+      if (st.salvage.keepUpgrades) {
+        const d = I.powerDelta(it);
+        if (d > AUTO.salvageKeepMin && (!up[it.slot] || d > up[it.slot].v)) up[it.slot] = { it, v: d };
+      }
+      if (econOn) {
+        const prev = st.equipped[it.slot];
+        const e = I.econScore(it);
+        if (e > (prev ? I.econScore(prev) : 0) + 1e-9 && (!econ[it.slot] || e > econ[it.slot].v + 1e-9)) econ[it.slot] = { it, v: e };
+      }
+    }
+    rt.asCtx = { up, econ, econOn };
+    rt.asCtxKey = key;
+    return rt.asCtx;
+  }
+  /**
+   * Shared auto-salvage test for fresh drops (drop=true) and stash sweeps. Never: Uniques, locked, corrupted,
+   * hand-crafted (`crafted`), bought (Sealed Relic Cache), equipped or previously worn (`worn`) relics; in sweeps
+   * also not the relic open in the detail panel or on the Crafting bench. Keep upgrades (re-evaluated against
+   * current gear; skipped for drops while headless, as before) and Keep economy relics (needs the autoEquip perk)
+   * each protect only the best such relic per slot.
+   */
+  function autoSalvageOk(it, drop) {
+    if (!it || it.rarity === 'unique' || it.locked || it.corrupted || it.crafted || it.bought || it.worn) return false;
+    if (!salvRuleOn(it.rarity)) return false;
+    const st = S();
+    const prev = st.equipped[it.slot];
+    if (prev === it || (!drop && I.isEquipped(it.id))) return false;
+    if (!drop && (it.id === st.ui.sel || it.id === st.ui.craftSel)) return false;
+    const ctx = salvageKeepCtx();
+    if (st.salvage.keepUpgrades && !(drop && headless())) {
+      const b = ctx.up[it.slot];
+      if (drop) { const d = I.powerDelta(it); if (d > AUTO.salvageKeepMin && (!b || d > b.v)) return false; }
+      else if (b && b.it === it) return false;
+    }
+    if (ctx.econOn) {
+      const b = ctx.econ[it.slot];
+      if (drop) { const e = I.econScore(it); if (e > (prev ? I.econScore(prev) : 0) + 1e-9 && (!b || e > b.v + 1e-9)) return false; }
+      else if (b && b.it === it) return false;
+    }
     return true;
+  }
+  function shouldAutoSalvage(it) { return autoSalvageOk(it, true); }
+  /** Melt one relic through auto-salvage: dust, counters, Rift Sifter. Returns Rift Dust gained. */
+  function autoMelt(it) {
+    const st = S();
+    const v = I.salvageItem(it);
+    st.stats.autoSalvaged = (st.stats.autoSalvaged || 0) + 1;
+    st.stats.autoSalvageDust = U.cap((st.stats.autoSalvageDust || 0) + v);
+    // Rift Sifter (Echo upgrade): auto-salvaged Magic/Rare relics sometimes leave a crafting currency
+    if (it.rarity !== 'normal' && SF.perks.has('riftSifter') && Math.random() < 0.2) {
+      const c = U.weighted(I.CURRENCIES).id;
+      st.cur[c] = U.cap((st.cur[c] || 0) + 1);
+      st.stats.curFound++;
+    }
+    rt.asSes.n++; rt.asSes.dust += v;
+    return v;
+  }
+  /** Stash relics the enabled rules would salvage right now (see autoSalvageOk). */
+  function autoSalvagePreview() {
+    const list = S().inventory.filter((it) => autoSalvageOk(it, false));
+    return { list, n: list.length, dust: list.reduce((a, it) => a + I.salvageValue(it), 0) };
+  }
+  /** Sweep the stash with the auto-salvage rules. Returns {n, gained}. */
+  function autoSalvageSweep() {
+    const st = S();
+    const pre = autoSalvagePreview();
+    if (!pre.n) return { n: 0, gained: 0 };
+    const set = new Set(pre.list);
+    const byR = {};
+    let gained = 0;
+    st.inventory = st.inventory.filter((it) => {
+      if (!set.has(it)) return true;
+      gained += autoMelt(it);
+      (byR[it.rarity] || (byR[it.rarity] = [])).push(it);
+      return false;
+    });
+    I._invVer++;
+    for (const r of I.RARITIES) if (byR[r]) logSalvage(byR[r][byR[r].length - 1], byR[r].length, 'swept');
+    if (st.ui.sel && !I.findItem(st.ui.sel)) st.ui.sel = null;
+    if (st.ui.craftSel && !I.findItem(st.ui.craftSel)) st.ui.craftSel = null;
+    if (!headless()) { rt.asToast.n += pre.n; rt.asToast.dust += gained; }
+    // one-time notice: the rules clean the stash too (shown live, also after an offline sweep). Separate from
+    // the per-rule confirmation in setSalvageRule, which background sweeps never consume.
+    if (!st.salvage.noticed) { st.salvage.noticed = true; rt.asNotice = { n: pre.n, dust: gained }; }
+    return { n: pre.n, gained };
   }
   /** Receive a dropped relic: auto-salvage rules, inventory, logs, announcements. */
   function receiveItem(it, opts) {
@@ -328,6 +440,8 @@
     st.stats.items[it.rarity] = (st.stats.items[it.rarity] || 0) + 1;
     if (it.rarity === 'unique') st.codex[it.uniq] = (st.codex[it.uniq] || 0) + 1;
     SF.events.emit('itemDrop', { rarity: it.rarity, uniq: it.uniq || null, ilvl: it.ilvl, source: opts.source || 'rift' });
+    // Sealed Relic Cache relics were paid for: never auto-salvaged (not even by stash sweeps)
+    if (opts.source === 'cache') it.bought = true;
     // Auto-Equip runs BEFORE the auto-salvage rules (whose keep-upgrades check is skipped headless),
     // so upgrades are worn instead of salvaged during offline progress too.
     if (autoEquipDrop(it)) {
@@ -336,15 +450,8 @@
       return true;
     }
     if ((opts.source || 'rift') === 'rift' && shouldAutoSalvage(it)) {
-      I.salvageItem(it);
-      st.stats.autoSalvaged++;
-      // Rift Sifter (Echo upgrade): auto-salvaged Magic/Rare relics sometimes leave a crafting currency
-      if (it.rarity !== 'normal' && SF.perks.has('riftSifter') && Math.random() < 0.2) {
-        const c = U.weighted(I.CURRENCIES).id;
-        st.cur[c] = U.cap((st.cur[c] || 0) + 1);
-        st.stats.curFound++;
-      }
-      if (it.rarity !== 'normal') logDrop(it, 'salvaged');
+      autoMelt(it);
+      logSalvage(it, 1);
       return false;
     }
     const kept = I._rawAdd(it);
@@ -661,6 +768,10 @@
     craftMaxPerTick: 1,      // intervals resolved per tick while headless (offline steps are up to ~30s; each
                              // craft re-evaluates gear, so this bounds catch-up cost while still crafting every step)
     logMax: 8,
+    salvageKeepMin: 0.01,    // Keep upgrades: never auto-salvage a relic that raises Combat Power by more than this
+    salvageEvery: 5,         // seconds of game time between auto-salvage stash sweeps (live; only when stash/gear/rules changed)
+    salvageEveryHeadless: 600, // ... while headless (offline catch-up, SF.debug.advance)
+    salvageToastEvery: 10,   // live: at most one "auto-salvaged N relics" toast per this many seconds (Rifts tab only)
   };
   const AUTO_CURS = ['ascendant', 'prism', 'flux', 'lumen']; // priority order; Voidstone/Riftseed are never auto-used
   const SMART_CURS = { flux: 1, lumen: 1 };                  // only with autoCraftSmart (reverted when power drops)
@@ -815,7 +926,39 @@
     }
     return done;
   }
+  function salvageSig() {
+    const st = S(), r = st.salvage;
+    return I._invVer + '|' + I.gearVer + '|' + st.level + '|' + (r.normal ? 1 : 0) + (r.magic ? 1 : 0) + (r.rare ? 1 : 0)
+      + (r.keepUpgrades ? 1 : 0) + (autoCfg().keepEcon !== false ? 1 : 0) + (SF.perks.has('autoSalvage') ? 1 : 0)
+      + (SF.perks.has('autoEquip') ? 1 : 0) + '|' + st.ui.sel + '|' + st.ui.craftSel;
+  }
+  /** Auto-salvage: periodic stash sweep + throttled live feedback. */
+  function salvageTick(dt) {
+    const st = S();
+    const rules = st.salvage;
+    // Magic/Rare rules can never be on without the Depth 25 perk (old saves / UI races)
+    if ((rules.magic || rules.rare) && !SF.perks.has('autoSalvage')) { rules.magic = false; rules.rare = false; }
+    const hl = headless();
+    rt.asT += dt;
+    if (rt.asT >= (hl ? AUTO.salvageEveryHeadless : AUTO.salvageEvery)) {
+      rt.asT = 0;
+      if (salvageSig() !== rt.asSig) { autoSalvageSweep(); rt.asSig = salvageSig(); }
+    }
+    if (hl) { rt.asToast.n = 0; rt.asToast.dust = 0; return; }
+    if (rt.asNotice && st.unlocked) {
+      const n = rt.asNotice; rt.asNotice = null;
+      rt.asToastAt = Date.now(); rt.asToast.n = 0; rt.asToast.dust = 0;
+      SF.ui.toast('Auto-salvage now also cleans your stash: <b>' + SF.fmtInt(n.n) + '</b> relic' + (n.n === 1 ? '' : 's') + ' salvaged → <b class="c-riftdust">+' + SF.fmt(n.dust) + ' Rift Dust</b>. '
+        + 'Locked 🔒, Unique, equipped, corrupted, hand-crafted and upgrade relics are always kept — lock a relic to protect it.', 'info', { icon: '✶', duration: 12000 });
+    }
+    if (rt.asToast.n && Date.now() - rt.asToastAt > AUTO.salvageToastEvery * 1000) {
+      rt.asToastAt = Date.now();
+      const t = rt.asToast; rt.asToast = { n: 0, dust: 0 };
+      if (SF.ui.activeTab() === 'rifts') SF.ui.toast('Auto-salvaged <b>' + SF.fmtInt(t.n) + '</b> stash relic' + (t.n === 1 ? '' : 's') + ' → <b class="c-riftdust">+' + SF.fmt(t.dust) + ' Rift Dust</b>', 'info', { icon: '✶', duration: 3000 });
+    }
+  }
   function autoTick(dt) {
+    salvageTick(dt);
     // Auto-Equip: periodic stash scan
     if (autoEquipOn()) {
       rt.aeT += dt;
@@ -1002,7 +1145,7 @@
     const st = S();
     if (!st.unlocked) { rt.offlineSnap = null; return; }
     rt.offlineSnap = { kills: st.stats.kills, bosses: st.stats.bossKills, items: U.clone(st.stats.items), cur: st.stats.curFound,
-      rd: st.riftDust, best: st.maxCleared, lvl: st.level, deaths: st.stats.deaths };
+      rd: st.riftDust, best: st.maxCleared, lvl: st.level, deaths: st.stats.deaths, as: st.stats.autoSalvaged || 0, asd: st.stats.autoSalvageDust || 0 };
   });
   SF.events.on('offlineEnd', (sum) => {
     const st = S();
@@ -1018,6 +1161,8 @@
     line += ', found <b>' + SF.fmtInt(items) + '</b> relics' + (uniq > 0 ? ' — <b class="r-unique">' + uniq + ' Unique!</b>' : '');
     line += ', <b>' + SF.fmtInt(st.stats.curFound - o.cur) + '</b> currency and <b class="c-riftdust">+' + SF.fmt(Math.max(0, st.riftDust - o.rd)) + '</b> Rift Dust.';
     sum.lines.push(line);
+    const asN = (st.stats.autoSalvaged || 0) - o.as;
+    if (asN > 0) sum.lines.push('✶ Auto-salvage melted <b>' + SF.fmtInt(asN) + '</b> relics → <b class="c-riftdust">+' + SF.fmt(Math.max(0, (st.stats.autoSalvageDust || 0) - o.asd)) + '</b> Rift Dust.');
     if (st.maxCleared > o.best) sum.lines.push('🌀 Pushed from Depth <b>' + o.best + '</b> to <b>' + st.maxCleared + '</b>.');
     if (st.level > o.lvl) sum.lines.push('🌀 Warden reached level <b>' + st.level + '</b>.');
   });
@@ -1047,6 +1192,8 @@
     buyCurrency, buyCapacity, buyCache, capCost, cacheCost,
     xpNeeded, isUnlocked,
     AUTO, autoEquipOn, autoCraftOn, autoEquipScan, autoCraftRun, autoCanReplace,
+    autoSalvageOk: (it) => autoSalvageOk(it, false), autoSalvagePreview: () => { const p = autoSalvagePreview(); return { n: p.n, dust: p.dust, ids: p.list.map((x) => x.id) }; },
+    autoSalvageSweep, salvageSession: () => ({ n: rt.asSes.n, dust: rt.asSes.dust }),
     dps: () => (rt.dpsHist.length ? U.sum(rt.dpsHist) / rt.dpsHist.length : 0),
     unlock() { const st = S(); st.unlocked = true; giveStarter(); },
     _rt: rt,
@@ -1506,8 +1653,8 @@
   function dropRow(e, isNew) {
     return h('div.drop-row' + (isNew ? '.new' : ''),
       h('span.drop-ic.r-' + e.r, I.SLOT_INFO[e.s] ? I.SLOT_INFO[e.s].icon : '?'),
-      h('span.drop-name.r-' + e.r, e.n),
-      h('span.drop-meta', e.h === 'salvaged' ? 'salvaged' : e.h === 'full' ? 'stash full!' : 'ilvl ' + e.l));
+      h('span.drop-name.r-' + e.r, e.c > 1 ? e.c + '× ' + (I.RARITY_INFO[e.r] ? I.RARITY_INFO[e.r].name : '') + ' relics' : e.n),
+      h('span.drop-meta', e.h === 'salvaged' ? 'auto-salvaged' : e.h === 'swept' ? 'salvaged from stash' : e.h === 'full' ? 'stash full!' : 'ilvl ' + e.l));
   }
   /** Incremental drop log: only rows newer than the last rendered head are created (and fade in). */
   function buildDropLog() {
@@ -1668,23 +1815,31 @@
         else SF.ui.toast('Your Warden already wears the strongest relics.', 'info');
       } }, '⇪ Equip best'),
       autoEquipToggle(true));
-    // auto salvage rules
+    // auto salvage rules (apply to new drops AND the stash; see autoSalvageOk)
     ui.autoRules = {};
-    const rules = h('div.row.gap.wrap.auto-rules', h('span.small.muted', { tip: 'Drops matching these rules are salvaged immediately' }, 'Auto-salvage:'));
+    const adv0 = SF.perks.has('autoSalvage');
+    const rulesLbl = h('span.small.muted', 'Auto-salvage:');
+    tip(rulesLbl, () => salvRulesTip());
+    const rules = h('div.row.gap.wrap.auto-rules', rulesLbl);
     for (const r of ['normal', 'magic', 'rare']) {
       const cb = h('input', { type: 'checkbox' });
-      cb.checked = !!st.salvage[r];
-      cb.addEventListener('change', () => { S().salvage[r] = cb.checked; });
-      const lbl = h('label.auto-lbl.r-' + r, cb, ' ' + I.RARITY_INFO[r].name);
+      const locked0 = r !== 'normal' && !adv0;
+      cb.disabled = locked0;               // disabled from the first render, not only after the first update
+      cb.checked = !!st.salvage[r] && !locked0;
+      cb.addEventListener('change', () => setSalvageRule(r, cb.checked, cb));
+      const lbl = h('label.auto-lbl.r-' + r + (locked0 ? '.locked' : ''), cb, ' ' + I.RARITY_INFO[r].name);
+      tip(lbl, () => salvRulesTip(r));
       ui.autoRules[r] = { cb, lbl };
       rules.appendChild(lbl);
     }
     const ku = h('input', { type: 'checkbox' });
     ku.checked = !!st.salvage.keepUpgrades;
-    ku.addEventListener('change', () => { S().salvage.keepUpgrades = ku.checked; });
-    rules.appendChild(h('label.auto-lbl', { tip: 'Never auto-salvage a relic that would raise your combat power by 1%+' }, ku, ' Keep upgrades'));
+    ku.addEventListener('change', () => setSalvageRule('keepUpgrades', ku.checked, ku));
+    ui.autoRules.keepUpgrades = { cb: ku };
+    rules.appendChild(h('label.auto-lbl', { tip: 'Never auto-salvage the best relic per slot that would raise your Combat Power by more than ' + (AUTO.salvageKeepMin * 100) + '%. Re-checked against your current gear every time the stash is swept: weaker same-slot upgrades and old \"upgrades\" are cleaned up. Press Equip best to wear them.' }, ku, ' Keep upgrades'));
     ui.rulesHint = h('span.tiny.faint');
     rules.appendChild(ui.rulesHint);
+    ui.salvStat = h('div.tiny.muted.salv-stat');
 
     ui.grid = h('div.relic-grid');
     ui.detail = h('div.relic-detail');
@@ -1698,9 +1853,55 @@
           h('div.row.gap.wrap.inv-tools', sortSel, rarSel, slotGroup),
           ui.grid,
           h('div.divider'),
-          salvMenu, rules),
+          salvMenu, rules, ui.salvStat),
         h('div.panel.detail-panel', h('div.panel-title', 'Selected Relic'), ui.detail))));
     ui.invSig = '';
+  }
+  function anySalvRule() { return ['normal', 'magic', 'rare'].some((r) => salvRuleOn(r)); }
+  function salvRulesTip(r) {
+    const lockedR = r && r !== 'normal' && !SF.perks.has('autoSalvage');
+    return '<div class="tt-title">Auto-salvage' + (r ? ' — ' + I.RARITY_INFO[r].name : '') + '</div>'
+      + (lockedR ? '<div class="bad">Locked: reach Rift Depth 25 once (Atlas milestone; it is claimed automatically).</div>' : '')
+      + 'Matching relics are salvaged for Rift Dust the moment they drop, and your stash is swept too: right away when you turn a rule on, then every ' + AUTO.salvageEvery + 's when the stash or your gear changed (offline too).'
+      + '<br><br>Always kept: 🔒 locked, Unique, equipped, previously worn, corrupted and hand-crafted relics, Sealed Relic Cache relics, the relic you have selected (detail panel or Crafting bench), the best upgrade per slot (with <i>Keep upgrades</i>) and, once Auto-Equip is unlocked, the best economy relic per slot (with <i>Keep economy relics</i>).';
+  }
+  /** Rules checkbox handler: locked rules can't turn on; turning a rule on (or Keep upgrades off) sweeps the stash now. */
+  function setSalvageRule(key, on, cb) {
+    const st = S();
+    if ((key === 'magic' || key === 'rare') && on && !SF.perks.has('autoSalvage')) {
+      cb.checked = false; st.salvage[key] = false;
+      SF.ui.toast('The ' + I.RARITY_INFO[key].name + ' rule unlocks at Rift Depth 25 (Atlas milestone).', 'warn');
+      return;
+    }
+    const prevVal = st.salvage[key];
+    const widens = key === 'keepUpgrades' ? !on : on;
+    st.salvage[key] = on;
+    if (!widens) { rt.asSig = ''; return; }
+    const conf = st.salvage.confirmed || (st.salvage.confirmed = {});
+    const pre = autoSalvagePreview();
+    // first sweep per rule asks once: Magic/Rare (valuable, maybe hand-crafted in old saves) for any relic, others for 5+
+    const ask = !conf[key] && pre.n >= (key === 'magic' || key === 'rare' ? 1 : 5);
+    if (ask) st.salvage[key] = prevVal; // hold the rule until confirmed (no sweep meanwhile)
+    const name = key === 'keepUpgrades' ? 'Turning off <b>Keep upgrades</b>' : 'Turning on the <b class="r-' + key + '">' + I.RARITY_INFO[key].name + '</b> rule';
+    const run = () => {
+      const res = autoSalvageSweep();
+      rt.asNotice = null; rt.asToast = { n: 0, dust: 0 }; rt.asToastAt = Date.now();
+      rt.asSig = salvageSig();
+      if (res.n) { sound('coin'); SF.ui.toast('Auto-salvage swept <b>' + res.n + '</b> relic' + (res.n === 1 ? '' : 's') + ' from your stash → <b class="c-riftdust">+' + fmt(res.gained) + ' Rift Dust</b>. 🔒 Lock relics to keep them.', 'good', { icon: '✶' }); }
+      else if (key !== 'keepUpgrades') SF.ui.toast(I.RARITY_INFO[key].name + ' auto-salvage on: new drops and your stash will be salvaged. Nothing in the stash matches right now.', 'info', { icon: '✶' });
+      ui.invSig = '';
+    };
+    // live UI action only; offline/background sweeps never wait on a dialog
+    if (ask) {
+      SF.ui.confirm(name + ' will also salvage <b>' + pre.n + '</b> relic' + (pre.n === 1 ? '' : 's') + ' already in your stash for <b class="c-riftdust">' + fmt(pre.dust) + ' Rift Dust</b>, and keep the stash clean from now on.'
+        + '<br><br><span class="small muted">Always kept: 🔒 locked, Unique, equipped, previously worn, corrupted and hand-crafted relics, the relic you have selected, and the best upgrade per slot (with Keep upgrades). Lock a relic to protect it.</span>',
+        () => { st.salvage[key] = on; conf[key] = true; st.salvage.noticed = true; run(); },
+        { title: 'Auto-salvage your stash?', yesText: 'Salvage them', noText: 'Cancel', onNo: () => { cb.checked = !!prevVal; } });
+      return;
+    }
+    if (pre.n) conf[key] = true;
+    st.salvage.noticed = true;
+    run();
   }
   function bulkSalvage(maxRank) {
     const st = S();
@@ -1744,8 +1945,19 @@
     SF.ui.setHTML(ui.invTitle, 'Stash <span class="' + (st.inventory.length >= cap ? 'bad' : 'muted') + '">' + st.inventory.length + ' / ' + cap + '</span>');
     for (const s in ui.slotBtns) SF.ui.setClass(ui.slotBtns[s], 'active', st.ui.fSlot === s);
     const adv = SF.perks.has('autoSalvage');
-    for (const r of ['magic', 'rare']) { ui.autoRules[r].cb.disabled = !adv; SF.ui.setClass(ui.autoRules[r].lbl, 'locked', !adv); }
-    SF.ui.setText(ui.rulesHint, adv ? '' : '(Magic/Rare rules unlock at Depth 25)');
+    for (const r of ['normal', 'magic', 'rare']) {
+      const lockedR = r !== 'normal' && !adv;
+      const want = !!st.salvage[r] && !lockedR;
+      if (ui.autoRules[r].cb.disabled !== lockedR) ui.autoRules[r].cb.disabled = lockedR;
+      if (ui.autoRules[r].cb.checked !== want) ui.autoRules[r].cb.checked = want;
+      SF.ui.setClass(ui.autoRules[r].lbl, 'locked', lockedR);
+    }
+    if (ui.autoRules.keepUpgrades.cb.checked !== !!st.salvage.keepUpgrades) ui.autoRules.keepUpgrades.cb.checked = !!st.salvage.keepUpgrades;
+    SF.ui.setText(ui.rulesHint, adv ? '' : '🔒 Magic/Rare rules: reach Rift Depth 25 (Atlas milestone, unlocks automatically)' + (st.bestEver > 0 ? ' — best so far: ' + st.bestEver : ''));
+    const ss = st.stats;
+    SF.ui.setHTML(ui.salvStat, 'Auto-salvaged: <b>' + SF.fmtInt(rt.asSes.n) + '</b> relic' + (rt.asSes.n === 1 ? '' : 's') + ' (<span class="c-riftdust">+' + fmt(rt.asSes.dust) + ' Rift Dust</span>) this session'
+      + ' · total <b>' + SF.fmtInt(ss.autoSalvaged || 0) + '</b>' + ((ss.autoSalvageDust || 0) > 0 ? ' (<span class="c-riftdust">+' + fmt(ss.autoSalvageDust) + '</span>)' : '')
+      + (anySalvRule() ? '' : ' · <span class="warn">all rules off</span>'));
     syncAutoEquip();
     const sig = I._invVer + '|' + I.gearVer + '|' + st.ui.sort + st.ui.fSlot + st.ui.fRarity + '|' + st.ui.sel + '|' + st.level;
     if (force || sig !== ui.invSig) {
@@ -1849,6 +2061,9 @@
     const id = st.ui.craftSel;
     const res = I.craft(id, cur);
     if (!res.ok) { SF.ui.toast(res.msg, 'warn'); sound('error'); return; }
+    // hand-crafted relics are never auto-salvaged (Auto-Craft only touches equipped relics, so it does not set this)
+    const crafted = I.findItem(id);
+    if (crafted && !crafted.crafted) { crafted.crafted = true; I._invVer++; }
     rt.lastCraft = res;
     const c = centerOf(ui.cBench);
     const fx = SF.fx || {};

@@ -758,7 +758,8 @@
     st.inventory.splice(i, 1);
     it.isNew = false;
     st.equipped[it.slot] = it;
-    if (prev) st.inventory.splice(i, 0, prev);
+    // a relic you wore is never auto-salvaged afterwards (swap back / compare; Auto-Craft may have crafted on it)
+    if (prev) { prev.worn = true; st.inventory.splice(i, 0, prev); }
     SF.items._invVer++;
     bump();
     SF.events.emit('buy', { what: 'equip', slot: it.slot });
@@ -797,6 +798,7 @@
     const it = st.equipped[slot];
     if (!it) return false;
     st.equipped[slot] = null;
+    it.worn = true;
     st.inventory.push(it);
     SF.items._invVer++;
     bump();
@@ -866,6 +868,9 @@
     if (it.corrupted) s += '<div class="itm-cor">Corrupted' + (it.cor && it.cor !== 'nothing' ? ' · ' + E(U.cap1(it.cor)) : '') + '</div>';
     const tags = [];
     if (it.locked) tags.push('🔒 Locked');
+    if (it.crafted) tags.push('✎ Hand-crafted');
+    if (it.bought) tags.push('Cache relic');
+    if (it.worn && !opts.equipped) tags.push('Worn before');
     if (opts.equipped) tags.push('Equipped');
     if (tags.length) s += '<div class="itm-tags">' + tags.join(' · ') + '</div>';
     if (!opts.noValue) s += '<div class="itm-foot"><span>Salvage</span><b class="c-riftdust">' + SF.fmt(salvageValue(it)) + ' Rift Dust</b></div>';
