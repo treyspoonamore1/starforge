@@ -765,21 +765,27 @@
     SF.events.emit('equip', { slot: it.slot, item: it.id });
     return true;
   }
-  /** Greedily equip the stash relic with the biggest combat-power gain in every slot. Returns number of swaps. */
-  function equipBest(minGain) {
+  /**
+   * Greedily equip the stash relic with the biggest combat-power gain in every slot. Returns number of swaps.
+   * opts (optional, used by Auto-Equip): {skipSlot(slot) -> bool, onSwap(item, prev, gain)}.
+   */
+  function equipBest(minGain, opts) {
     const st = R();
     if (!st) return 0;
+    opts = opts || {};
     const thr = minGain == null ? 0.005 : minGain;
     let swaps = 0;
     for (let pass = 0; pass < 2; pass++) {
       for (const slot of SLOTS) {
+        if (opts.skipSlot && opts.skipSlot(slot)) continue;
         let best = null, bestD = thr;
         for (const it of st.inventory) {
           if (it.slot !== slot) continue;
           const d = powerDelta(it);
           if (d > bestD) { bestD = d; best = it; }
         }
-        if (best && equip(best.id)) swaps++;
+        const prev = st.equipped[slot];
+        if (best && equip(best.id)) { swaps++; if (opts.onSwap) opts.onSwap(best, prev, bestD); }
       }
     }
     return swaps;

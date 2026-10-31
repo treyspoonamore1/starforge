@@ -77,7 +77,7 @@ All code lives in `/home/user/starforge/`.
 Script load order in index.html: util, state, core, ui, fx, forge, comets, ascension, constellation, items, rifts, transcend, achievements, stats, main.
 
 ## Inter-module contract (fixed names — implement exactly; consumers must guard with `SF.x && SF.x.fn`)
-- Perks registry (core): `SF.perks.add(name, sourceId, fn->bool)`, `SF.perks.has(name)`. Known perks: `autoForge` (auto buy-max forges each tick), `autoForgeUpgrades`, `keepForgeUpgrades` (on ascend), `autoAscend`, `autoSalvage`, `autoDepth` (auto push to next depth on clear).
+- Perks registry (core): `SF.perks.add(name, sourceId, fn->bool)`, `SF.perks.has(name)`. Known perks: `autoForge` (auto buy-max forges each tick), `autoForgeUpgrades`, `keepForgeUpgrades` (on ascend), `autoAscend`, `autoSalvage`, `autoDepth` (auto push to next depth on clear), `autoEquip` (rift milestone, wear relic upgrades automatically), `autoCraft` / `autoCraftSmart` (Echo upgrades, auto-craft equipped relics).
 - Extra mod keys: `autoClick` (flat, clicks/sec), `startDust` (flat, dust given after ascend reset), `combat.enemyHp`, `combat.enemyDmg` (multipliers on monsters, challenges use these), `starPoints` (flat bonus Star Points), `inventory` (flat bonus slots), `ascendShardsKeep`.
 - `SF.forge`: `dustPerSec()`, `clickPower()`, `doClick(x,y)`, `buy(tier, n)`, `buyMax(tier)`, `buyAllMax()`, `buyUpgrade(id)`, `buyAllUpgrades()`, `owned(tier)`; state `SF.state.forge` has `dust`, `runDust` (since last ascend), `totalDust` (all time), `clicks`.
 - `SF.ascension`: `canAscend()`, `shardGain()`, `ascend(force)`; state `SF.state.ascension` has `shards`, `totalShards`, `count`, `fastest`.

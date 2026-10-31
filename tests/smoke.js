@@ -179,6 +179,140 @@ async function visitAllTabs(page, tag) {
   await page.evaluate(() => SF.ui.switchTab('rifts'));
   await page.waitForTimeout(2500);
 
+  section('Rifts — Auto-Equip & Auto-Craft');
+  const au = await page.evaluate(() => {
+    const st = SF.state.rifts, I = SF.items, r = {};
+    const T = SF.state.transcend;
+    // a random relic can be worse (economy affixes): roll until it is a clear Combat Power upgrade
+    const upgrade = (slot, il) => { let x = null; for (let i = 0; i < 80; i++) { x = I.generate(il, 'rare', { slot }); if (I.powerDelta(x) > 0.05) return x; } return x; };
+    const upgSnap = Object.assign({}, T.upg);
+    r.defaults = !!(st.auto && st.auto.equip === true && st.auto.cur.ascendant.on && st.auto.cur.prism.on && !st.auto.cur.lumen.on && !st.auto.cur.flux.on);
+    // --- Auto-Equip: milestone perk (Depth 35)
+    r.ms = SF.rifts.MILESTONES.some((m) => m.d === 35 && m.perk === 'autoEquip');
+    st.claimed[35] = true; st.bestEver = Math.max(st.bestEver, 35); SF.mods.invalidate();
+    r.perkEquip = SF.perks.has('autoEquip');
+    st.auto.equip = true; st.auto.equipUniques = true; // the 30-min farm may have equipped uniques
+    for (const s of I.SLOTS) if (st.equipped[s]) st.equipped[s].locked = false;
+    I.salvage(st.inventory.filter((x) => x.rarity !== 'unique').slice(0, 15).map((x) => x.id));
+    // (a) stash upgrade gets equipped by the periodic headless scan
+    const w = upgrade('weapon', Math.max(60, st.maxCleared + 40));
+    I._rawAdd(w, { force: true });
+    r.wDelta = I.powerDelta(w);
+    SF.debug.advance(SF.rifts.AUTO.equipEveryHeadless + 30, 10);
+    r.scanEquipped = !!(st.equipped.weapon && st.equipped.weapon.id === w.id);
+    // (b) a drop received while headless is equipped, not auto-salvaged (salvage rule would eat it)
+    const sv = Object.assign({}, st.salvage);
+    Object.assign(st.salvage, { normal: true, magic: true, rare: true, keepUpgrades: true });
+    st.claimed[25] = true;
+    const hd = upgrade('helm', Math.max(60, st.maxCleared + 40));
+    let fired = false, wasHeadless = false;
+    const off = SF.events.on('tick', () => { if (fired) return; fired = true; wasHeadless = !!SF.core.headless; SF.rifts.receiveItem(hd, { source: 'rift' }); });
+    r.hdDelta = I.powerDelta(hd);
+    SF.debug.advance(2, 1);
+    off && off();
+    r.hdWhere = I.isEquipped(hd.id) ? 'eq' : st.inventory.some((x) => x.id === hd.id) ? 'inv' : 'gone';
+    Object.assign(st.salvage, sv);
+    r.dropHeadless = wasHeadless;
+    r.dropEquipped = !!(st.equipped.helm && st.equipped.helm.id === hd.id);
+    // (c) locked equipped relics are never replaced
+    st.equipped.helm.locked = true;
+    const hd2 = upgrade('helm', Math.max(80, st.maxCleared + 60));
+    r.hd2Delta = I.powerDelta(hd2);
+    I._rawAdd(hd2, { force: true });
+    SF.debug.advance(SF.rifts.AUTO.equipEveryHeadless + 30, 10);
+    r.lockRespected = st.equipped.helm.id === hd.id;
+    st.equipped.helm.locked = false;
+    // (d) equipped Uniques are kept unless the player allows replacing them
+    st.auto.equipUniques = false;
+    const uq = I.generate(10, 'unique'); I._rawAdd(uq, { force: true }); I.equip(uq.id);
+    const better = upgrade(uq.slot, Math.max(90, st.maxCleared + 70));
+    r.betterDelta = I.powerDelta(better);
+    I._rawAdd(better, { force: true });
+    SF.rifts.autoEquipScan();
+    r.uniqueKept = st.equipped[uq.slot].id === uq.id;
+    st.auto.equipUniques = true;
+    SF.rifts.autoEquipScan();
+    r.uniqueReplacedWhenAllowed = st.equipped[uq.slot].id !== uq.id;
+    st.auto.equipUniques = false;
+    r.autoEquips = st.stats.autoEquips;
+    // --- Auto-Craft: Echo upgrades
+    r.perkCraftOff = SF.perks.has('autoCraft');
+    T.upg.workshop = 1; SF.mods.invalidate();
+    r.perkCraft = SF.perks.has('autoCraft') && !SF.perks.has('autoCraftSmart');
+    st.auto.craft = true;
+    // isolate: only the two test relics are equipped, auto-equip paused
+    st.auto.equip = false;
+    const eqSnap = Object.assign({}, st.equipped);
+    for (const s of I.SLOTS) st.equipped[s] = null;
+    I.bump();
+    const ring = I.generate(30, 'normal', { slot: 'ring' }); I._rawAdd(ring, { force: true }); I.equip(ring.id); ring.locked = true;
+    const am = I.generate(30, 'magic', { slot: 'amulet' }); I._rawAdd(am, { force: true }); I.equip(am.id); am.locked = true;
+    while (am.affixes.length > 1) am.affixes.pop();
+    st.auto.cur.ascendant.keep = 1; st.auto.cur.prism.keep = 2;
+    st.cur.ascendant = 4; st.cur.prism = 10;
+    const crafts0 = st.stats.crafts, auto0 = st.stats.autoCrafts;
+    const used = [];
+    const offC = SF.events.on('craft', (e) => used.push(e.currency + ':' + (e.item === ring.id ? 'ring' : e.item === am.id ? 'am' : 'other')));
+    SF.debug.advance(65, 1);
+    offC && offC();
+    r.used = used.join(',');
+    r.ringRarity = ring.rarity;
+    r.amAffixes = am.affixes.length;
+    r.ascLeft = st.cur.ascendant; r.prismLeft = st.cur.prism;
+    r.ascUsed = ring.rarity === 'rare' && am.rarity === 'rare' && used.filter((x) => x.startsWith('ascendant:')).length === 3;
+    r.prismUsed = used.some((x) => x.startsWith('prism:')) && !used.some((x) => /^(voidstone|riftseed|lumen|flux)|:other/.test(x));
+    r.reserves = st.cur.ascendant >= 1 && st.cur.prism >= 2;
+    r.counted = st.stats.autoCrafts > auto0 && st.stats.crafts - crafts0 >= st.stats.autoCrafts - auto0;
+    // reserve exactly met -> nothing spent
+    st.cur.ascendant = 1; st.cur.prism = 2;
+    const ring2 = I.generate(30, 'normal', { slot: 'ring' }); I._rawAdd(ring2, { force: true }); ring.locked = false; I.equip(ring2.id); ring2.locked = true;
+    SF.rifts.autoCraftRun(10);
+    r.reserveHold = st.cur.ascendant === 1 && st.cur.prism === 2 && ring2.rarity === 'normal';
+    // smart mode: Lumen/Flux need Artificer's Eye and never lower Combat Power
+    st.auto.cur.lumen.on = true; st.auto.cur.flux.on = true;
+    st.cur.lumen = 60; st.cur.flux = 60;
+    const lumen0 = st.cur.lumen;
+    SF.rifts.autoCraftRun(10);
+    r.smartGated = st.cur.lumen === lumen0;
+    T.upg.eye = 1; SF.mods.invalidate();
+    r.perkSmart = SF.perks.has('autoCraftSmart');
+    st.auto.cur.ascendant.on = false; st.auto.cur.prism.on = false;
+    st.auto.cur.lumen.keep = 5; st.auto.cur.flux.keep = 5;
+    let worse = 0, runs = 0, p = SF.rifts.computeWarden().power;
+    const pStart = p;
+    for (let i = 0; i < 40; i++) {
+      runs += SF.rifts.autoCraftRun(3);
+      const q = SF.rifts.computeWarden().power;
+      if (q < p * (1 - 1e-9)) worse++;
+      p = q;
+    }
+    r.smartRuns = runs; r.smartWorse = worse; r.pStart = pStart; r.pEnd = p;
+    r.smartReserve = st.cur.lumen >= 5 && st.cur.flux >= 5;
+    r.reverts = st.stats.autoCraftReverts;
+    r.noVoid = true;
+    // restore settings / ownership so later sections are unaffected
+    Object.assign(st.auto.cur.ascendant, { on: true, keep: 1 }); Object.assign(st.auto.cur.prism, { on: true, keep: 2 });
+    Object.assign(st.auto.cur.lumen, { on: false, keep: 10 }); Object.assign(st.auto.cur.flux, { on: false, keep: 10 });
+    for (const s of I.SLOTS) { const it = st.equipped[s]; if (it) { it.locked = false; st.equipped[s] = null; I._rawAdd(it, { force: true }); } }
+    for (const s of I.SLOTS) if (eqSnap[s]) { st.inventory = st.inventory.filter((x) => x.id !== eqSnap[s].id); st.equipped[s] = eqSnap[s]; }
+    I.bump(); st.auto.equip = true;
+    T.upg = upgSnap; SF.mods.invalidate();
+    r.log = st.auto.log.length;
+    return r;
+  });
+  check('automation settings have defaults', au.defaults, au);
+  check('Depth 35 milestone grants perk autoEquip', au.ms && au.perkEquip, au);
+  check('auto-equip equips a stash upgrade headlessly', au.wDelta > 0.01 && au.scanEquipped, au);
+  check('auto-equip wears a headless drop instead of salvaging it', au.dropHeadless && au.dropEquipped, au);
+  check('auto-equip respects locked relics', au.hd2Delta > 0.01 && au.lockRespected, au);
+  check('auto-equip keeps equipped Uniques unless allowed', au.uniqueKept && (au.uniqueReplacedWhenAllowed || !(au.betterDelta > 0.01)), au);
+  check('Artificer\'s Workshop grants autoCraft', !au.perkCraftOff && au.perkCraft, au);
+  check('auto-craft uses Ascendant Orb / Prism on equipped relics', au.ascUsed && au.prismUsed && au.amAffixes > 1 && au.counted, au);
+  check('auto-craft respects reserves', au.reserves && au.reserveHold, au);
+  check('Lumen/Flux auto-craft gated behind Artificer\'s Eye', au.smartGated && au.perkSmart, au);
+  check('smart auto-craft never lowers Combat Power', au.smartRuns > 0 && au.smartWorse === 0 && au.pEnd >= au.pStart && au.smartReserve, au);
+  check('automation log written', au.log > 0, au);
+
   section('Layer 2 — Transcendence');
   await page.evaluate(() => { const need = (SF.transcend.BAL ? SF.transcend.BAL.unlockShards : 1e12) * 2; SF.state.ascension.transShards = Math.max(SF.state.ascension.transShards || 0, need); SF.debug.give('shards', need); SF.debug.advance(5); });
   check('canTranscend', await page.evaluate(() => SF.transcend.canTranscend()));

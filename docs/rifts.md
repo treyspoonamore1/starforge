@@ -102,6 +102,26 @@ Other stats:
   - Normal is on by default and always available. The Magic and Rare rules need perk `autoSalvage`, which the Depth 25 milestone also grants.
   - "Keep upgrades" skips relics that would raise combat power by more than 1% (checked live only).
   - Uniques are never auto-salvaged. Relics from comets and caches are not auto-salvaged.
+- **Auto-Equip** (perk `autoEquip`, Depth 35 milestone; toggle `auto.equip`, default on, shown on the Combat, Relics and Crafting panes):
+  - Every received relic (rift drops, comets, caches) is compared with the equipped one **before** the auto-salvage rules run. If it raises Combat Power by more than `AUTO.equipMin` (1%), it is equipped at once. This also happens headless/offline, where the "keep upgrades" salvage check is skipped. If the replaced relic overfills the stash it is salvaged (never if locked or Unique).
+  - A full stash scan (`I.equipBest(1%, {skipSlot, onSwap})`) runs every 5s of live game time when the stash, gear or level changed (at least every 60s), and every 1800s while headless.
+  - Never replaces a **locked** equipped relic. Equipped **Uniques** are kept unless `auto.equipUniques` ("Replace equipped Uniques") is on.
+  - Live swaps produce one merged toast at most every 4s. Counted in `stats.autoEquips`.
+- **Auto-Craft** (perk `autoCraft` from the Echo upgrade *Artificer's Workshop*; perk `autoCraftSmart` from *Artificer's Eye*). Master toggle `auto.craft`. It is configured in the **Automation** panel on the Crafting sub-tab.
+  - Every `AUTO.craftEvery` (10s) of game time it uses up to `AUTO.craftPerInterval` (3) currencies on **equipped, non-unique, uncorrupted** relics. The starting slot rotates. Live, up to 6 intervals can be banked; headless, one interval is resolved per tick, so a ~30s offline step does at most 3 crafts.
+  - Priority and defaults:
+
+    | Currency | Use | Default | Reserve (`keep`) |
+    |---|---|---|---|
+    | Ascendant Orb | Normal → Magic → Rare (never exalts Rares) | on | 1 |
+    | Prism | add an affix while there is room | on | 2 |
+    | Flux | reroll affixes (Magic/Rare) | off, needs `autoCraftSmart` | 10 |
+    | Lumen | reroll values | off, needs `autoCraftSmart` | 10 |
+
+  - Flux and Lumen are "safe": the item is snapshotted, and if `computeWarden().power` drops after the craft the snapshot is restored (the currency stays spent; counted in `stats.autoCraftReverts`).
+  - A currency is only used while owned > reserve. Voidstone and Riftseed are never used automatically.
+  - Uses `I.craft`, so `stats.crafts`, the `craft` event and the crafting achievements count auto-crafts too. Auto-crafts are also counted separately in `stats.autoCrafts`.
+  - `auto.log` keeps the last 8 actions (repeated actions are merged ×n). The panel shows 5 of them.
 - **Tooltips** include a stat-by-stat comparison against the equipped relic (green ▲ / red ▼) and the Combat Power delta in %. Tiles get a green ▲ when the relic is an upgrade.
 
 ### Rift Shop
@@ -118,6 +138,7 @@ Milestones depend on the **all-time record** (`bestEver`) and are permanent, cla
 | 20 | loot ×1.25 | 1 |
 | 25 | perk `autoSalvage` | 2 |
 | 30 | shards ×1.25 | 1 |
+| 35 | perk `autoEquip` (added later; milestones are keyed by depth in `claimed`, so old saves just claim it on load) | 1 |
 | 40 | currency ×1.25 | 2 |
 | 50 | dust ×2 | 2 |
 | 60 | combat.dmg ×1.5 | 2 |
@@ -148,7 +169,12 @@ Depth 49 @1h, 108 @3h, ~200 @7h, ~300 @13h, ~400 @48h. Walls get progressively h
   inventory:[item], equipped:{weapon,armor,helm,ring,amulet,charm: item|null},
   salvage:{normal,magic,rare,keepUpgrades}, claimed:{depth:true}, bossFirst:{depth:n}, codex:{uniqueId:n},
   pendingPoints, pointsGranted, stats:{kills,eliteKills,bossKills,deaths,items:{normal,magic,rare,unique},salvaged,
-  autoSalvaged,riftDustEarned,crafts,corrupts,curFound,time,highestHit,overflow}, log:[last 20 drops], ui:{...} }
+  autoSalvaged,riftDustEarned,crafts,corrupts,curFound,time,highestHit,overflow,autoEquips,autoCrafts,autoCraftReverts},
+  log:[last 20 drops],
+  auto:{equip:true, equipUniques:false, craft:true,
+        cur:{ascendant:{on:true,keep:1}, prism:{on:true,keep:2}, flux:{on:false,keep:10}, lumen:{on:false,keep:10}},
+        log:[{t,x,k:'equip'|'craft'|'revert',n}]},
+  ui:{...} }
 ```
 Item: `{id, base, slot, ilvl, rarity, name, rname?, uniq?, imp:{stat,r,v}, cimp?:{stat,r,v}, affixes:[{id,k,r,v}], umods?:[{stat,r,v}], corrupted, cor?, locked, isNew, t}`.
 
@@ -165,8 +191,8 @@ There is no ascend reset.
 - `rifts:milestones`:
   - multipliers: `dust`, `shards`, `echoes`, `combat.loot`, `combat.rarity`, `combat.currency`, `offline`, `combat.dmg`, `combat.hp`
   - flat: `inventory`
-- Perks `autoDepth` and `autoSalvage` (source `rifts:milestone`).
-- **Read:** `combat.dmg`, `combat.hp`, `combat.speed`, `combat.loot`, `combat.rarity`, `combat.currency`, `combat.enemyHp`, `combat.enemyDmg`, flat `inventory`, perks `autoDepth` and `autoSalvage`.
+- Perks `autoDepth`, `autoSalvage` and `autoEquip` (source `rifts:milestone`).
+- **Read:** `combat.dmg`, `combat.hp`, `combat.speed`, `combat.loot`, `combat.rarity`, `combat.currency`, `combat.enemyHp`, `combat.enemyDmg`, flat `inventory`, perks `autoDepth`, `autoSalvage`, `autoEquip`, `autoCraft`, `autoCraftSmart` (the last two come from transcend.js).
 - Warden combat stats from gear are internal; they are not registered as mods, so nothing is counted twice.
 
 ## Events emitted
@@ -193,11 +219,12 @@ The offline welcome-back modal gets lines for kills, bosses, relics, uniques, cu
 - **Loot and points:** `receiveItem(item, {source})`, `addItem(item)`, `grantPoints(n, reason)`
 - **Milestones:** `milestoneMult(key)`, `milestoneList()`, `nextMilestone()`
 - **Shop:** `buyCurrency(id, n)`, `buyCapacity()`, `buyCache()`, `capCost()`, `cacheCost()`
+- **Automation:** `AUTO` (tunables), `autoEquipOn()`, `autoCraftOn()`, `autoEquipScan()`, `autoCraftRun(cap)` (one interval, returns crafts made), `autoCanReplace(slot)`
 - **Misc:** `isUnlocked()`, `unlock()` (debug/testing), `dps()` (measured), `BAL`, `BANDS`, `MILESTONES`
 
 `SF.items`:
 - **Generation:** `generate(ilvl, rarity?, {slot, base, uniq, boss, elite})`, `rollRarity(mult, opts)`
-- **Equipment:** `equipped()` (→ `{slot: item|null}`), `equip(id)`, `unequip(slot)`, `toggleLock(id)`, `findItem(id)`, `isEquipped(id)`
+- **Equipment:** `equipped()` (→ `{slot: item|null}`), `equip(id)`, `equipBest(minGain=0.005, {skipSlot, onSwap}?)`, `unequip(slot)`, `toggleLock(id)`, `findItem(id)`, `isEquipped(id)`
 - **Stash:** `addToInventory(item)` / `addItem(item)` (go through `receiveItem`, used by comets), `capacity()`, `salvage(ids)`, `salvageValue(item)`
 - **Crafting:** `canCraft(item, cur)` (→ '' or reason), `craft(id, cur)` (→ `{ok,msg,before,after,saved,outcome}`)
 - **Stats:** `aggregate(override?)`, `agg(stat)`, `itemStats(item)`, `itemLines(item)`, `power(override?)`, `powerDelta(item)`

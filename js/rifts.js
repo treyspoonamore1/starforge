@@ -90,6 +90,9 @@
     { d: 20, pts: 1, text: '+25% Item Quantity', mod: ['combat.loot', 1.25] },
     { d: 25, pts: 2, text: 'Unlock advanced Auto-Salvage (Magic & Rare rules)', perk: 'autoSalvage' },
     { d: 30, pts: 1, text: '+25% Celestial Shards', mod: ['shards', 1.25] },
+    // Added later: milestones are keyed by depth (state.claimed[d]), so inserting one keeps old saves valid;
+    // the list must stay sorted by depth (checkMilestones stops at the first unreached entry).
+    { d: 35, pts: 1, text: 'Auto-Equip: the Warden wears upgrades as soon as they drop', perk: 'autoEquip' },
     { d: 40, pts: 2, text: '+25% Crafting Currency drops', mod: ['combat.currency', 1.25] },
     { d: 50, pts: 2, text: 'Stardust ×2', mod: ['dust', 2] },
     { d: 60, pts: 2, text: 'Warden Damage +50%', mod: ['combat.dmg', 1.5] },
@@ -135,8 +138,15 @@
     salvage: { normal: true, magic: false, rare: false, keepUpgrades: true },
     claimed: {}, bossFirst: {}, codex: {}, pendingPoints: 0, pointsGranted: 0,
     stats: { kills: 0, eliteKills: 0, bossKills: 0, deaths: 0, items: { normal: 0, magic: 0, rare: 0, unique: 0 },
-      salvaged: 0, autoSalvaged: 0, riftDustEarned: 0, crafts: 0, corrupts: 0, curFound: 0, time: 0, highestHit: 0, overflow: 0 },
+      salvaged: 0, autoSalvaged: 0, riftDustEarned: 0, crafts: 0, corrupts: 0, curFound: 0, time: 0, highestHit: 0, overflow: 0,
+      autoEquips: 0, autoCrafts: 0, autoCraftReverts: 0 },
     log: [],
+    // Automation settings (Auto-Equip: Atlas milestone; Auto-Craft: Echo upgrades). keep = reserve never spent.
+    auto: {
+      equip: true, equipUniques: false, craft: true,
+      cur: { ascendant: { on: true, keep: 1 }, prism: { on: true, keep: 2 }, flux: { on: false, keep: 10 }, lumen: { on: false, keep: 10 } },
+      log: [],
+    },
     ui: { sub: 'combat', sort: 'rarity', fSlot: 'all', fRarity: 'all', sel: null, craftSel: null, shopQty: 1 },
   }));
 
@@ -145,6 +155,7 @@
   const rt = {
     fx: [], dmgAcc: 0, dmgT: 0, dpsHist: [], sessionKills: 0, sessionTime: 0, genThisTick: 0,
     wCache: null, wKey: '', lastCraft: null, offlineSnap: null, bannerT: 0, banner: null,
+    aeT: 0, acT: 0, acRot: 0, aeToast: [], aeToastAt: 0,
   };
   function pushFx(e) { if (headless()) return; rt.fx.push(e); if (rt.fx.length > 80) rt.fx.splice(0, rt.fx.length - 80); }
 
@@ -317,6 +328,13 @@
     st.stats.items[it.rarity] = (st.stats.items[it.rarity] || 0) + 1;
     if (it.rarity === 'unique') st.codex[it.uniq] = (st.codex[it.uniq] || 0) + 1;
     SF.events.emit('itemDrop', { rarity: it.rarity, uniq: it.uniq || null, ilvl: it.ilvl, source: opts.source || 'rift' });
+    // Auto-Equip runs BEFORE the auto-salvage rules (whose keep-upgrades check is skipped headless),
+    // so upgrades are worn instead of salvaged during offline progress too.
+    if (autoEquipDrop(it)) {
+      logDrop(it, 'equipped');
+      if (!headless() && it.rarity === 'unique' && opts.source !== 'comet') announceUnique(it);
+      return true;
+    }
     if ((opts.source || 'rift') === 'rift' && shouldAutoSalvage(it)) {
       I.salvageItem(it);
       st.stats.autoSalvaged++;
@@ -626,6 +644,150 @@
     }
   }
 
+  /* ========================================================== AUTOMATION === */
+  // Auto-Equip (perk autoEquip, Atlas Depth 35) and Auto-Craft (perks autoCraft / autoCraftSmart, Echo upgrades).
+  // Pure logic, headless-safe: driven by the tick (game time) and by receiveItem.
+  const AUTO = {
+    equipMin: 0.01,          // minimum Combat Power gain (1%) before Auto-Equip swaps a relic (avoids churn)
+    equipEvery: 5,           // seconds of game time between stash scans (live; skipped when stash & gear are unchanged)
+    equipEveryHeadless: 1800, // ... while headless: drops are checked the moment they arrive, so the full
+                             //     stash scan (~1 power calc per relic) only catches slow drifts (levels, crafts)
+    craftEvery: 10,          // seconds of game time per Auto-Craft interval
+    craftPerInterval: 3,     // max currencies used per interval
+    craftMaxIntervals: 6,    // max intervals banked (live)
+    craftMaxPerTick: 1,      // intervals resolved per tick while headless (offline steps are up to ~30s; each
+                             // craft re-evaluates gear, so this bounds catch-up cost while still crafting every step)
+    logMax: 8,
+  };
+  const AUTO_CURS = ['ascendant', 'prism', 'flux', 'lumen']; // priority order; Voidstone/Riftseed are never auto-used
+  const SMART_CURS = { flux: 1, lumen: 1 };                  // only with autoCraftSmart (reverted when power drops)
+  function autoCfg() {
+    const st = S();
+    const def = SF.defaultState ? SF.defaultState('rifts').auto : null;
+    if (!st.auto || typeof st.auto !== 'object') st.auto = def;
+    const a = st.auto;
+    if (!a.cur || typeof a.cur !== 'object') a.cur = def.cur;
+    for (const c of AUTO_CURS) if (!a.cur[c] || typeof a.cur[c] !== 'object') a.cur[c] = def.cur[c];
+    if (!Array.isArray(a.log)) a.log = [];
+    return a;
+  }
+  function autoEquipOn() { return SF.perks.has('autoEquip') && !!autoCfg().equip; }
+  function autoCraftOn() { return SF.perks.has('autoCraft') && !!autoCfg().craft; }
+  /** Auto-Equip never replaces a locked relic, nor an equipped Unique unless the player allows it. */
+  function autoCanReplace(slot) {
+    const cur = S().equipped[slot];
+    if (!cur) return true;
+    if (cur.locked) return false;
+    if (cur.rarity === 'unique' && !autoCfg().equipUniques) return false;
+    return true;
+  }
+  function autoLog(text, kind) {
+    const a = autoCfg();
+    const top = a.log[0];
+    if (top && top.x === text) { top.n = (top.n || 1) + 1; top.t = SF.core.time; return; }
+    a.log.unshift({ t: SF.core.time, x: text, k: kind || '' , n: 1 });
+    if (a.log.length > AUTO.logMax) a.log.length = AUTO.logMax;
+  }
+  function noteAutoEquip(it, gain) {
+    const st = S();
+    st.stats.autoEquips = (st.stats.autoEquips || 0) + 1;
+    autoLog('Equipped ' + it.name + ' (' + I.SLOT_INFO[it.slot].name + ')', 'equip');
+    if (!headless()) rt.aeToast.push({ name: it.name, r: it.rarity, gain });
+  }
+  /** Equip a freshly received relic immediately if it beats the equipped one by AUTO.equipMin. */
+  function autoEquipDrop(it) {
+    if (!it || !autoEquipOn() || !autoCanReplace(it.slot)) return false;
+    const st = S();
+    const gain = I.powerDelta(it);
+    if (!(gain > AUTO.equipMin)) return false;
+    const prev = st.equipped[it.slot];
+    I._rawAdd(it, { force: true });
+    if (!I.equip(it.id)) return false;
+    it.isNew = false;
+    // the replaced relic goes to the stash; if that overfills it, melt it (never locked ones or Uniques)
+    if (prev && st.inventory.length > I.capacity() && !prev.locked && prev.rarity !== 'unique') I.salvage([prev.id]);
+    noteAutoEquip(it, gain);
+    return true;
+  }
+  /** Scan the stash for upgrades (respecting locks). Returns the number of swaps. */
+  function autoEquipScan() {
+    if (!autoEquipOn()) return 0;
+    return I.equipBest(AUTO.equipMin, { skipSlot: (slot) => !autoCanReplace(slot), onSwap: (it, prev, gain) => noteAutoEquip(it, gain) });
+  }
+  function restoreItem(it, snap) {
+    for (const k of Object.keys(it)) delete it[k];
+    Object.assign(it, snap);
+  }
+  /** One Auto-Craft interval: up to `cap` currencies on equipped, non-unique, uncorrupted relics. Returns crafts made. */
+  function autoCraftRun(cap) {
+    const st = S();
+    const a = autoCfg();
+    const smart = SF.perks.has('autoCraftSmart');
+    let done = 0;
+    rt.acRot = (rt.acRot + 1) % I.SLOTS.length; // rotate the starting slot so one relic can't hog every interval
+    for (const cur of AUTO_CURS) {
+      const c = a.cur[cur];
+      if (!c || !c.on || done >= cap) continue;
+      if (SMART_CURS[cur] && !smart) continue;
+      const keep = Math.max(0, Math.floor(Number(c.keep) || 0));
+      for (let k = 0; k < I.SLOTS.length && done < cap; k++) {
+        if ((st.cur[cur] || 0) <= keep) break; // reserve
+        const it = st.equipped[I.SLOTS[(rt.acRot + k) % I.SLOTS.length]];
+        if (!it || it.rarity === 'unique' || it.corrupted) continue;
+        if (cur === 'ascendant' && it.rarity === 'rare') continue; // only Normal -> Magic -> Rare
+        if (I.canCraft(it, cur)) continue;
+        const snap = SMART_CURS[cur] ? I.clone(it) : null;
+        const p0 = snap ? computeWarden().power : 0;
+        const r = I.craft(it.id, cur);
+        if (!r || !r.ok) continue;
+        done++;
+        st.stats.autoCrafts = (st.stats.autoCrafts || 0) + 1;
+        const cname = I.CUR_BY_ID[cur].name;
+        if (snap) {
+          const p1 = computeWarden().power;
+          if (p1 < p0 * (1 - 1e-9)) {
+            restoreItem(it, snap);
+            I.bump();
+            st.stats.autoCraftReverts = (st.stats.autoCraftReverts || 0) + 1;
+            autoLog(cname + ' on ' + it.name + ': worse, reverted', 'revert');
+          } else autoLog(cname + ' on ' + it.name + (p0 > 0 && p1 > p0 ? ': +' + ((p1 / p0 - 1) * 100).toFixed(1) + '% power' : ''), 'craft');
+        } else autoLog(cname + ' on ' + it.name + (r.after && r.before && r.after.rarity !== r.before.rarity ? ' → ' + I.RARITY_INFO[r.after.rarity].name : ''), 'craft');
+      }
+    }
+    return done;
+  }
+  function autoTick(dt) {
+    // Auto-Equip: periodic stash scan
+    if (autoEquipOn()) {
+      rt.aeT += dt;
+      const hl = headless();
+      if (rt.aeT >= (hl ? AUTO.equipEveryHeadless : AUTO.equipEvery)) {
+        const sig = I._invVer + '|' + I.gearVer + '|' + S().level;
+        if (hl || sig !== rt.aeSig || rt.aeT >= 60) { rt.aeT = 0; autoEquipScan(); rt.aeSig = I._invVer + '|' + I.gearVer + '|' + S().level; }
+      }
+    } else rt.aeT = 0;
+    // Auto-Craft: timer with a bounded backlog (a 30s offline step makes ~3 intervals, never thousands of crafts)
+    if (autoCraftOn()) {
+      rt.acT = Math.min(rt.acT + dt, AUTO.craftEvery * AUTO.craftMaxIntervals);
+      let runs = 0;
+      const maxRuns = headless() ? AUTO.craftMaxPerTick : AUTO.craftMaxIntervals;
+      while (rt.acT >= AUTO.craftEvery && runs++ < maxRuns) {
+        rt.acT -= AUTO.craftEvery;
+        if (!autoCraftRun(AUTO.craftPerInterval)) { rt.acT = Math.min(rt.acT, AUTO.craftEvery); break; }
+      }
+    } else rt.acT = 0;
+    // merged, throttled toast for auto-equips (live only)
+    if (!headless() && rt.aeToast.length) {
+      const now = Date.now();
+      if (now - rt.aeToastAt > 4000) {
+        rt.aeToastAt = now;
+        const list = rt.aeToast.splice(0);
+        const last = list[list.length - 1];
+        SF.ui.toast('Auto-equipped <b class="r-' + last.r + '">' + U.esc(last.name) + '</b>' + (list.length > 1 ? ' <span class="muted">(+' + (list.length - 1) + ' more)</span>' : ' <span class="good">+' + (last.gain * 100).toFixed(1) + '% power</span>'), 'good', { icon: '⇪' });
+      }
+    } else if (headless()) rt.aeToast.length = 0;
+  }
+
   /* ========================================================= DEPTH CONTROL === */
   function setDepth(d) {
     const st = S();
@@ -714,6 +876,7 @@
   SF.mods.addFlat('inventory', 'rifts:milestones', () => milestoneInv(), 'Rift milestones');
   SF.perks.add('autoDepth', 'rifts:milestone', () => !!S().claimed[15]);
   SF.perks.add('autoSalvage', 'rifts:milestone', () => !!S().claimed[25]);
+  SF.perks.add('autoEquip', 'rifts:milestone', () => !!S().claimed[35]);
 
   SF.resets.register('transcend', () => {
     const st = S();
@@ -750,6 +913,7 @@
     if (!st.starter) giveStarter();
     flushPoints();
     combatTick(dt);
+    autoTick(dt);
   });
   SF.events.on('load', () => {
     const st = S();
@@ -767,6 +931,8 @@
     if (!(typeof st.timer === 'number' && st.timer === st.timer)) st.timer = 1;
     if (!Array.isArray(st.log)) st.log = [];
     st.log = st.log.filter((x) => x && typeof x === 'object');
+    autoCfg();
+    autoCfg().log = autoCfg().log.filter((x) => x && typeof x === 'object' && typeof x.x === 'string');
     I.bump();
     checkMilestones();
   });
@@ -820,6 +986,7 @@
     grantPoints, milestoneMult, milestoneList, nextMilestone,
     buyCurrency, buyCapacity, buyCache, capCost, cacheCost,
     xpNeeded, isUnlocked,
+    AUTO, autoEquipOn, autoCraftOn, autoEquipScan, autoCraftRun, autoCanReplace,
     dps: () => (rt.dpsHist.length ? U.sum(rt.dpsHist) / rt.dpsHist.length : 0),
     unlock() { const st = S(); st.unlocked = true; giveStarter(); },
     _rt: rt,
@@ -853,6 +1020,130 @@
     tip(el, itemTip(it));
     if (opts.onclick) el.addEventListener('click', () => opts.onclick(it));
     return el;
+  }
+
+  /* ------------------------------------------------------- AUTOMATION UI --- */
+  // "Auto-equip" checkbox shown on several panes (Combat, Relics, Crafting). Built once, synced in syncAutoEquip().
+  function autoEquipToggle(short) {
+    const cb = h('input', { type: 'checkbox' });
+    cb.checked = !!autoCfg().equip;
+    cb.addEventListener('change', () => { autoCfg().equip = cb.checked; rt.aeT = 1e9; /* scan on next tick */ });
+    const lbl = h('label.auto-lbl', cb, short ? ' Auto-equip' : ' Auto-equip upgrades');
+    tip(lbl, () => SF.perks.has('autoEquip')
+      ? '<div class="tt-title">Auto-Equip</div>Relics that raise Combat Power by more than ' + (AUTO.equipMin * 100) + '% are equipped the moment they drop (also offline), and the stash is re-checked every ' + AUTO.equipEvery + 's. Locked equipped relics are never replaced; equipped Uniques only if you allow it on the Crafting tab.'
+      : '<div class="tt-title">Auto-Equip (locked)</div>Reach <b>Depth 35</b> (Atlas milestone) to unlock.');
+    (ui.aeToggles = ui.aeToggles || []).push({ cb, lbl });
+    return lbl;
+  }
+  function syncAutoEquip() {
+    if (!ui.aeToggles) return;
+    const has = SF.perks.has('autoEquip');
+    const on = !!autoCfg().equip;
+    for (const t of ui.aeToggles) {
+      if (!t.lbl.isConnected) continue;
+      if (t.cb.checked !== on) t.cb.checked = on;
+      t.cb.disabled = !has;
+      SF.ui.setClass(t.lbl, 'locked', !has);
+      SF.ui.setClass(t.lbl, 'auto-on', has && on);
+    }
+  }
+  function buildAutomationPanel() {
+    const a = autoCfg();
+    ui.au = { rows: {} };
+    const ae = autoEquipToggle(false);
+    const uq = h('input', { type: 'checkbox' });
+    uq.checked = !!a.equipUniques;
+    uq.addEventListener('change', () => { autoCfg().equipUniques = uq.checked; });
+    const uqLbl = h('label.auto-lbl', { tip: 'Allow Auto-Equip to replace an equipped Unique when a relic with more Combat Power drops. Uniques often carry economy effects that Combat Power does not measure.' }, uq, ' Replace equipped Uniques');
+    ui.au.uq = { cb: uq, lbl: uqLbl };
+    ui.au.aeHint = h('span.tiny.faint');
+    const master = h('input', { type: 'checkbox' });
+    master.checked = !!a.craft;
+    master.addEventListener('change', () => { autoCfg().craft = master.checked; });
+    const masterLbl = h('label.auto-lbl', master, ' Auto-craft equipped relics');
+    tip(masterLbl, () => SF.perks.has('autoCraft')
+      ? '<div class="tt-title">Auto-Craft</div>Every ' + AUTO.craftEvery + 's of game time (also offline) up to ' + AUTO.craftPerInterval + ' currencies are used on your <b>equipped</b>, non-unique, uncorrupted relics. Voidstone and Riftseed are never used automatically. Amounts at or below the reserve are never spent.'
+      : '<div class="tt-title">Auto-Craft (locked)</div>Buy the Echo upgrade <b>Artificer\'s Workshop</b> (Transcendence → Automation).');
+    ui.au.master = { cb: master, lbl: masterLbl };
+    ui.au.acHint = h('span.tiny.faint');
+    const rowsEl = h('div.au-curs');
+    const DESC = {
+      ascendant: 'Upgrades Normal → Magic → Rare.',
+      prism: 'Adds an affix while there is room.',
+      flux: 'Rerolls the affixes; undone if Combat Power drops.',
+      lumen: 'Rerolls every value; undone if Combat Power drops.',
+    };
+    for (const id of AUTO_CURS) {
+      const c = I.CUR_BY_ID[id];
+      const cb = h('input', { type: 'checkbox' });
+      cb.checked = !!a.cur[id].on;
+      cb.addEventListener('change', () => { autoCfg().cur[id].on = cb.checked; });
+      const keep = h('input.input.input-sm.au-keep', { type: 'number', min: 0, step: 1 });
+      keep.value = a.cur[id].keep;
+      keep.addEventListener('change', () => { const v = Math.max(0, Math.floor(Number(keep.value) || 0)); autoCfg().cur[id].keep = v; keep.value = v; keep.blur(); });
+      const own = h('b.mono');
+      const lbl = h('label.auto-lbl.au-cur', { style: { '--cc': c.color } }, cb, h('span.au-ic', c.icon), h('span.au-name', c.name));
+      const row = h('div.au-row', lbl, h('span.tiny.muted.au-desc', DESC[id]), h('span.small.muted', 'Owned ', own), h('span.small.muted.au-keep-l', 'Keep ≥ ', keep));
+      tip(row, () => {
+        let t = '<div class="tt-title" style="color:' + c.color + '">' + c.icon + ' Auto-' + c.name + '</div><div>' + DESC[id] + '</div><div class="small muted">Never spends below the reserve (Keep ≥).</div>';
+        if (SMART_CURS[id] && !SF.perks.has('autoCraftSmart')) t += '<div class="tt-sep"></div><div class="bad small">Requires the Echo upgrade <b>Artificer\'s Eye</b>: without it a reroll could make your relic worse.</div>';
+        return t;
+      });
+      ui.au.rows[id] = { cb, keep, own, lbl, row };
+      rowsEl.appendChild(row);
+    }
+    ui.au.status = h('div.small.muted.au-status');
+    ui.au.log = h('div.au-log');
+    ui.au.logSig = '';
+    return h('div.panel.au-panel', h('div.panel-title', '⚙ Automation'),
+      h('div.au-sec', h('div.row.gap.wrap', ae, uqLbl, ui.au.aeHint)),
+      h('div.divider'),
+      h('div.au-sec', h('div.row.gap.wrap', masterLbl, ui.au.acHint), rowsEl),
+      ui.au.status, ui.au.log);
+  }
+  function updateAutomationPanel() {
+    if (!ui.au) return;
+    const st = S(), a = autoCfg();
+    const hasE = SF.perks.has('autoEquip'), hasC = SF.perks.has('autoCraft'), smart = SF.perks.has('autoCraftSmart');
+    syncAutoEquip();
+    if (ui.au.uq.cb.checked !== !!a.equipUniques) ui.au.uq.cb.checked = !!a.equipUniques;
+    ui.au.uq.cb.disabled = !hasE;
+    SF.ui.setClass(ui.au.uq.lbl, 'locked', !hasE);
+    SF.ui.setText(ui.au.aeHint, hasE ? '' : '🔒 Unlocks at Rift Depth 35 (Atlas milestone)');
+    if (ui.au.master.cb.checked !== !!a.craft) ui.au.master.cb.checked = !!a.craft;
+    ui.au.master.cb.disabled = !hasC;
+    SF.ui.setClass(ui.au.master.lbl, 'locked', !hasC);
+    SF.ui.setClass(ui.au.master.lbl, 'auto-on', hasC && !!a.craft);
+    SF.ui.setText(ui.au.acHint, !hasC ? "🔒 Echo upgrade: Artificer's Workshop" : !smart ? "Lumen & Flux need Artificer's Eye" : '');
+    for (const id of AUTO_CURS) {
+      const r = ui.au.rows[id], c = a.cur[id];
+      const locked = !hasC || (SMART_CURS[id] && !smart);
+      if (r.cb.checked !== !!c.on) r.cb.checked = !!c.on;
+      r.cb.disabled = locked;
+      r.keep.disabled = locked;
+      SF.ui.setClass(r.lbl, 'locked', locked);
+      SF.ui.setClass(r.row, 'locked', locked);
+      SF.ui.setClass(r.row, 'active', !locked && !!c.on && !!a.craft);
+      SF.ui.setText(r.own, fmt(st.cur[id] || 0));
+      if (document.activeElement !== r.keep && String(r.keep.value) !== String(c.keep)) r.keep.value = c.keep;
+    }
+    const s = st.stats;
+    let line = 'Auto-equips ' + SF.fmtInt(s.autoEquips || 0) + ' · Auto-crafts ' + SF.fmtInt(s.autoCrafts || 0) + (smart ? ' (reverted ' + SF.fmtInt(s.autoCraftReverts || 0) + ')' : '');
+    if (hasC && a.craft) line += ' · next craft in ' + Math.max(0, AUTO.craftEvery - rt.acT).toFixed(0) + 's';
+    SF.ui.setText(ui.au.status, line);
+    const top = a.log[0];
+    const sig = a.log.length + '|' + (top ? top.t + ':' + top.n : '');
+    if (sig !== ui.au.logSig) {
+      ui.au.logSig = sig;
+      ui.au.log.innerHTML = '';
+      if (!a.log.length) ui.au.log.appendChild(h('div.tiny.faint', 'Recent automatic actions appear here.'));
+      for (const e of a.log.slice(0, 5)) {
+        ui.au.log.appendChild(h('div.au-log-row.au-' + (e.k || 'x'),
+          h('span.au-log-ic', e.k === 'equip' ? '⇪' : e.k === 'revert' ? '↺' : '⚒'),
+          h('span.au-log-x', e.x + (e.n > 1 ? ' ×' + e.n : '')),
+          h('span.tiny.faint', SF.fmtTime(Math.max(0, SF.core.time - e.t)) + ' ago')));
+      }
+    }
   }
 
   /* ------------------------------------------------------------ RENDER --- */
@@ -960,7 +1251,7 @@
     tip(ui.autoLbl, () => SF.perks.has('autoDepth')
       ? '<div class="tt-title">Auto-Push</div>Automatically advance to the next depth after clearing one. After 3 deaths the Warden retreats and retries in ' + BAL.retry + 's.'
       : '<div class="tt-title">Auto-Push (locked)</div>Reach <b>Depth 15</b> (Atlas milestone) or unlock the auto-depth perk elsewhere.');
-    ui.depthCtl = h('div.depth-ctl', h('div.btn-group', ui.btnFirst, ui.btnPrev), ui.depthInput, h('div.btn-group', ui.btnNext), ui.btnPush, ui.btnRetreat, h('span.spacer'), ui.autoLbl);
+    ui.depthCtl = h('div.depth-ctl', h('div.btn-group', ui.btnFirst, ui.btnPrev), ui.depthInput, h('div.btn-group', ui.btnNext), ui.btnPush, ui.btnRetreat, h('span.spacer'), ui.autoLbl, autoEquipToggle(true));
     ui.retryInfo = h('div.small.muted.retry-info');
 
     // side: warden stats
@@ -1094,6 +1385,7 @@
     const hasAuto = SF.perks.has('autoDepth');
     ui.autoBox.disabled = !hasAuto;
     SF.ui.setClass(ui.autoLbl, 'locked', !hasAuto);
+    syncAutoEquip();
     let ri = '';
     if (st.retry && st.retryTimer > 0) ri = 'Retreated after repeated deaths — retrying Depth ' + (st.maxCleared + 1) + ' in ' + SF.fmtTime(st.retryTimer) + '.';
     else if (pushing && st.pushDeaths > 0) ri = 'Deaths at this depth: ' + st.pushDeaths + ' / ' + BAL.pushDeathsToRetreat + (st.maxCleared >= 1 ? ' (then retreat)' : '');
@@ -1301,7 +1593,8 @@
         const n = I.equipBest();
         if (n) { sound('upgrade'); SF.ui.toast('Equipped <b>' + n + '</b> upgrade' + (n > 1 ? 's' : '') + '.', 'good', { icon: '⇪' }); ui.invSig = ''; }
         else SF.ui.toast('Your Warden already wears the strongest relics.', 'info');
-      } }, '⇪ Equip best'));
+      } }, '⇪ Equip best'),
+      autoEquipToggle(true));
     // auto salvage rules
     ui.autoRules = {};
     const rules = h('div.row.gap.wrap.auto-rules', h('span.small.muted', { tip: 'Drops matching these rules are salvaged immediately' }, 'Auto-salvage:'));
@@ -1380,6 +1673,7 @@
     const adv = SF.perks.has('autoSalvage');
     for (const r of ['magic', 'rare']) { ui.autoRules[r].cb.disabled = !adv; SF.ui.setClass(ui.autoRules[r].lbl, 'locked', !adv); }
     SF.ui.setText(ui.rulesHint, adv ? '' : '(Magic/Rare rules unlock at Depth 25)');
+    syncAutoEquip();
     const sig = I._invVer + '|' + I.gearVer + '|' + st.ui.sort + st.ui.fSlot + st.ui.fRarity + '|' + st.ui.sel + '|' + st.level;
     if (force || sig !== ui.invSig) {
       ui.invSig = sig;
@@ -1471,7 +1765,8 @@
       h('div.panel.craft-pick', h('div.panel-title', 'Choose a Relic'), ui.cList),
       h('div.col',
         h('div.panel.panel-glow', h('div.panel-title', 'Crafting Bench'), h('div.bench-wrap', ui.cBench, ui.cCurs)),
-        h('div.panel', h('div.panel-title', 'Result'), ui.cResult))));
+        h('div.panel', h('div.panel-title', 'Result'), ui.cResult),
+        buildAutomationPanel())));
     ui.cListSig = '';
     ui.cBenchSig = '';
     renderResult();
@@ -1549,6 +1844,7 @@
       SF.ui.setClass(b.b, 'can', ok);
       SF.ui.setClass(b.b, 'none', n <= 0);
     }
+    updateAutomationPanel();
   }
 
   /* -------------------------------------------------------------- SHOP --- */
@@ -1661,6 +1957,7 @@
       + '<span>Salvaged (auto)</span><b>' + SF.fmtInt(s.salvaged) + ' (' + SF.fmtInt(s.autoSalvaged) + ')</b>'
       + '<span>Rift Dust earned</span><b class="c-riftdust">' + fmt(s.riftDustEarned) + '</b>'
       + '<span>Currency found</span><b>' + SF.fmtInt(s.curFound) + '</b><span>Crafts (corruptions)</span><b>' + SF.fmtInt(s.crafts) + ' (' + SF.fmtInt(s.corrupts) + ')</b>'
+      + '<span>Auto-crafts (reverted)</span><b>' + SF.fmtInt(s.autoCrafts || 0) + ' (' + SF.fmtInt(s.autoCraftReverts || 0) + ')</b><span>Auto-equips</span><b>' + SF.fmtInt(s.autoEquips || 0) + '</b>'
       + '<span>Highest hit</span><b>' + fmt(s.highestHit) + '</b><span>Time in rifts</span><b>' + SF.fmtTime(s.time) + '</b>'
       + '<span>Star Points from rifts</span><b class="c-point">' + SF.fmtInt(st.pointsGranted) + '</b>');
   }
